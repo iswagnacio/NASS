@@ -377,7 +377,8 @@ class OuterLoop:
 
     def __init__(self, specimen_id: int, data_dir: str,
                  api_key: str = None, model: str = "claude-sonnet-4-20250514",
-                 top_k: int = 5, provider: str = "anthropic"):
+                 top_k: int = 5, provider: str = "anthropic",
+                 inner_epochs: int = 80, inner_lr: float = 0.02):
         self.specimen_id = specimen_id
         self.data_dir = Path(data_dir)
         self.api_key = api_key
@@ -385,6 +386,8 @@ class OuterLoop:
         self.provider = provider
         self.heap = TopKHeap(k=top_k)
         self.history: list[dict] = []
+        self.inner_epochs = inner_epochs
+        self.inner_lr = inner_lr
 
     def _call_llm(self, system: str, user: str) -> str:
         """Call the LLM API. Supports Anthropic and OpenAI."""
@@ -449,26 +452,22 @@ class OuterLoop:
         """
         Run the Jaxley inner loop for a proposal.
 
-        This is a placeholder that should call jaxley_baseline_fit.fit_cell()
-        with the proposal's channel configuration. For now it returns a
-        skeleton diagnostic — the actual integration with the fitting script
-        is completed when connecting the full pipeline.
+        Calls general_fit.fit_proposal() which dynamically builds a
+        Jaxley cell from the proposal's channel list, runs gradient descent,
+        and returns a DiagnosticReport with real fitting results.
         """
         logger.info(f"  Inner loop for proposal #{proposal.proposal_id}: "
                     f"{proposal.channels}")
         logger.info(f"  Rationale: {proposal.rationale[:200]}")
 
-        # TODO: Actually build Jaxley cell from proposal.to_jaxley_code(),
-        # run gradient descent, extract diagnostics.
-        # For now, return placeholder diagnostics.
+        from general_fit import fit_proposal
 
-        return DiagnosticReport(
+        return fit_proposal(
             proposal=proposal,
             specimen_id=self.specimen_id,
-            final_loss=proposal.loss,
-            n_sim_spikes=0,
-            n_target_spikes=56,
-            no_spikes=True,
+            data_dir=str(self.data_dir),
+            epochs=self.inner_epochs,
+            lr=self.inner_lr,
         )
 
     def run(self, max_iterations: int = 5,
