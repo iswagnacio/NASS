@@ -1,0 +1,16 @@
+# IDEs and Editors
+.vscode/
+
+# Python Cache
+__pycache__/
+*.pyc
+.DS_Store
+
+# Virtual Environments
+env/
+venv/
+.conda/
+
+# Local Data (Don't push heavy NWB files or downloaded datasets!)
+cell_types_data/
+data/
