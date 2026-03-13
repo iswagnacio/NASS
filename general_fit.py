@@ -53,7 +53,7 @@ from allensdk.core.cell_types_cache import CellTypesCache
 
 from channels import Kv3, IM, IAHP, IT, ICaL, IH, CHANNEL_REGISTRY
 from sga import ModelProposal, DiagnosticReport
-from jaxley_fit import (
+from sim_fit import (
     load_training_sweep,
     prepare_stimulus,
     prepare_target,
