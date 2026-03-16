@@ -9,27 +9,35 @@ using BrainPy's differentiable simulation and gradient descent.
 This is the "BrainPy fixed-HH" baseline — the simplest biophysical model
 that the agent-discovered models must beat.
 
-MIGRATED FROM JAXLEY TO BRAINPY:
-  - jx.Compartment() + insert(Na/K/Leak) → bp.dyn.CondNeuGroupLTC subclass
-  - cell.stimulate() / cell.record() → bp.DSRunner with monitors
-  - jx.integrate(cell, param_state=...) → step-by-step BrainPy simulation
-  - cell.make_trainable / ParamTransform / SigmoidTransform
-      → manual bm.Variable params + sigmoid_transform helper + jax.grad
-
 Usage:
-    python jaxley_fit.py --data-dir ./cell_types_data
-    python jaxley_fit.py --data-dir ./cell_types_data --specimen-id 469801138
-    python jaxley_fit.py --data-dir ./cell_types_data --epochs 200 --lr 0.01
-    python jaxley_fit.py --data-dir ./cell_types_data --all
+    python sim_fit.py --data-dir ./cell_types_data
+    python sim_fit.py --data-dir ./cell_types_data --specimen-id 469801138
+    python sim_fit.py --data-dir ./cell_types_data --epochs 200 --lr 0.01
+    python sim_fit.py --data-dir ./cell_types_data --all
 
 Requires:
     pip install brainpy jax jaxlib optax allensdk matplotlib
 """
+"""
+BrainPy Baseline Fitter — Fixed Na+K+Leak HH Model (Weeks 3–4)
+================================================================
 
-# ---- JAX config must come before any JAX imports ----
-from jax import config
-config.update("jax_enable_x64", True)
-# config.update("jax_platform_name", "gpu")  # Uncomment if GPU available
+Fits a single-compartment Hodgkin-Huxley model (Na + K + Leak) to PV+
+fast-spiking interneuron recordings from the Allen Cell Types Database
+using BrainPy's differentiable simulation and gradient descent.
+
+This is the "BrainPy fixed-HH" baseline — the simplest biophysical model
+that the agent-discovered models must beat.
+
+Usage:
+    python sim_fit.py --data-dir ./cell_types_data
+    python sim_fit.py --data-dir ./cell_types_data --specimen-id 469801138
+    python sim_fit.py --data-dir ./cell_types_data --epochs 200 --lr 0.01
+    python sim_fit.py --data-dir ./cell_types_data --all
+
+Requires:
+    pip install brainpy jax jaxlib optax allensdk matplotlib
+"""
 
 import os
 import json
@@ -39,10 +47,7 @@ from pathlib import Path
 
 import numpy as np
 print(np.__version__)  # Must be 1.26.x
-import xarray as xr
-import jax
-import jax.numpy as jnp
-from jax import jit, value_and_grad
+#import xarray as xr
 import optax
 import matplotlib
 matplotlib.use("Agg")
@@ -50,6 +55,10 @@ import matplotlib.pyplot as plt
 
 import brainpy as bp
 import brainpy.math as bm
+
+# ---- Enable 64-bit precision (must be called early) ----
+bm.enable_x64()
+# bm.set_platform("gpu")  # Uncomment if GPU available
 
 from allensdk.core.cell_types_cache import CellTypesCache
 
@@ -63,7 +72,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # 1. Allen Data Loader — extract a single training sweep
 # ---------------------------------------------------------------------------
-# (Unchanged from original — no Jaxley dependency)
 
 def load_training_sweep(ctc: CellTypesCache, specimen_id: int,
                         sweep_index: dict) -> dict:
@@ -173,19 +181,11 @@ class FixedHHNeuron(bp.dyn.CondNeuGroupLTC):
     Single-compartment HH neuron with Na, K, and Leak channels.
     This is the fixed 3-channel baseline model.
 
-    Replaces the Jaxley build_hh_cell() which did:
-        comp = jx.Compartment()
-        comp.insert(Na()); comp.insert(K()); comp.insert(Leak())
-        comp.set("Na_gNa", 0.5); comp.set("K_gK", 0.2); ...
-
     BrainPy uses class composition: channels are attached as attributes
     in __init__, and CondNeuGroupLTC automatically collects their currents.
 
-    PARAMETER NOTE: Jaxley uses S/cm² for conductance and the cell geometry
-    (radius/length) affects current density. BrainPy's built-in HH channels
-    use mS/cm² (msiemens). We use BrainPy's native units here, which means
-    the parameter values differ from the Jaxley version but produce
-    equivalent biophysics.
+    Parameters use BrainPy's native units (mS/cm² for conductance,
+    uF/cm² for capacitance, mV for potentials).
     """
 
     def __init__(self, size, gNa=120.0, gK=36.0, gL=0.03, eLeak=-60.0,
@@ -224,7 +224,6 @@ def build_hh_cell(dt: float = 0.025) -> FixedHHNeuron:
 # ---------------------------------------------------------------------------
 # 2b. Stimulus and Target preparation
 # ---------------------------------------------------------------------------
-# (Unchanged — no Jaxley dependency. Just resampling.)
 
 def prepare_stimulus(sweep: dict, dt: float = 0.025) -> tuple:
     """
@@ -271,29 +270,22 @@ def prepare_target(sweep: dict, dt: float = 0.025) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # 3. Simulation & Loss Functions
 # ---------------------------------------------------------------------------
-# KEY MIGRATION POINT: Jaxley's simulation+loss was:
-#   1. cell.stimulate(current) to register stimulus
-#   2. jx.integrate(cell, param_state=...) inside a differentiable fn
-#   3. cell.make_trainable() + cell.get_parameters() + ParamTransform
-#
-# BrainPy equivalent:
-#   1. We build a function that manually steps the model, injecting
-#      current at each timestep, inside a jax.lax.scan loop.
-#   2. Parameters are stored as a flat dict of jnp arrays, and we
-#      write them onto model attributes before each forward pass.
-#   3. We use a manual sigmoid_transform instead of Jaxley's
-#      ParamTransform/SigmoidTransform.
+# BrainPy simulation approach:
+#   1. Build a FixedHHNeuron with given parameters and run via bp.DSRunner.
+#   2. Parameters are stored as a flat dict of bm arrays in unconstrained
+#      space, mapped to biophysical bounds via sigmoid_transform.
+#   3. bm.grad(fn, return_value=True) differentiates through the simulation.
 
 def sigmoid_transform(x, lower, upper):
     """Map unconstrained value x to (lower, upper) via sigmoid."""
-    return lower + (upper - lower) * jax.nn.sigmoid(x)
+    return lower + (upper - lower) * (1.0 / (1.0 + bm.exp(-x)))
 
 
 def inverse_sigmoid(y, lower, upper):
     """Map constrained value y in (lower, upper) to unconstrained space."""
     p = (y - lower) / (upper - lower)
-    p = jnp.clip(p, 1e-6, 1.0 - 1e-6)
-    return jnp.log(p / (1.0 - p))
+    p = bm.clip(p, 1e-6, 1.0 - 1e-6)
+    return bm.log(p / (1.0 - p))
 
 
 # Parameter bounds — biophysically reasonable ranges for PV+ FS cells
@@ -312,19 +304,15 @@ def run_simulation(gNa, gK, gL, eLeak, C, eNa, eK, stimulus, dt):
     """
     Run a BrainPy HH simulation with given parameters.
 
-    This replaces jx.integrate(cell, param_state=...).
-
-    We rebuild the model with the given parameters each call so that
-    the computation is fully inside the JAX trace (differentiable).
-    BrainPy models are JAX-compatible — all state updates use bm ops
-    which are traced by JAX's autodiff.
+    Builds the model with the given parameters each call so that
+    the computation is fully traceable and differentiable.
     """
     model = FixedHHNeuron(size=1, gNa=gNa, gK=gK, gL=gL,
                           eLeak=eLeak, eNa=eNa, eK=eK, C=C)
 
     runner = bp.DSRunner(model, monitors=['V'], dt=dt)
     runner.run(inputs=stimulus)
-    v = bm.as_jax(runner.mon['V'])
+    v = bm.as_numpy(runner.mon['V'])
     return v.flatten()
 
 
@@ -332,12 +320,8 @@ def build_loss_fn(target_v, stimulus, dt):
     """
     Build a differentiable loss function.
 
-    The loss takes unconstrained parameters, transforms them to
-    biophysical bounds via sigmoid, runs the BrainPy simulation,
-    and returns MSE.
-
-    Replaces Jaxley's build_loss_fn which used cell.data_set() +
-    ParamTransform + jx.integrate().
+    Takes unconstrained parameters, transforms them to biophysical
+    bounds via sigmoid, runs the BrainPy simulation, and returns MSE.
     """
 
     def loss_fn(opt_params):
@@ -359,7 +343,7 @@ def build_loss_fn(target_v, stimulus, dt):
         v_target_trimmed = target_v[:n]
 
         # Waveform MSE loss
-        mse = jnp.mean((v_sim_trimmed - v_target_trimmed) ** 2)
+        mse = bm.mean((v_sim_trimmed - v_target_trimmed) ** 2)
         return mse
 
     return loss_fn
@@ -379,13 +363,6 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
     3. Set up differentiable simulation
     4. Run gradient descent with optax
     5. Save results and diagnostic plots
-
-    Replaces the original Jaxley-based fit_cell which used:
-        cell = build_hh_cell()
-        cell.stimulate(stimulus)
-        cell.make_trainable("Na_gNa"); ...
-        loss_fn = build_loss_fn(cell, target, dt, transform)
-        grad_fn = jit(value_and_grad(loss_fn))
     """
     logger.info(f"Fitting specimen {specimen_id}...")
     out = output_dir / str(specimen_id)
@@ -395,7 +372,7 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
     sweep = load_training_sweep(ctc, specimen_id, sweep_index)
     stimulus, t_max = prepare_stimulus(sweep, dt)
     target_v = prepare_target(sweep, dt)
-    target_v_jnp = jnp.array(target_v)
+    target_v_bm = bm.array(target_v)
 
     logger.info(
         f"  Sweep {sweep['sweep_number']}: "
@@ -419,7 +396,7 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
         if (end_idx - start_idx) > max_samples:
             end_idx = start_idx + max_samples
         stimulus = stimulus[start_idx:end_idx]
-        target_v_jnp = target_v_jnp[start_idx:end_idx]
+        target_v_bm = target_v_bm[start_idx:end_idx]
         t_max = len(stimulus) * dt
         logger.info(
             f"  Windowed to stimulus region: {start_idx*dt:.0f}–{end_idx*dt:.0f} ms "
@@ -428,7 +405,7 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
     elif t_max > max_duration_ms:
         n_keep = int(max_duration_ms / dt) + 1
         stimulus = stimulus[:n_keep]
-        target_v_jnp = target_v_jnp[:n_keep]
+        target_v_bm = target_v_bm[:n_keep]
         t_max = max_duration_ms
         logger.info(f"  No clear stimulus found; truncated to first {max_duration_ms:.0f} ms")
 
@@ -439,13 +416,19 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
         "eLeak": -60.0, "C": 1.0, "eNa": 50.0, "eK": -77.0,
     }
     opt_params = {
-        name: inverse_sigmoid(jnp.array(val), *PARAM_BOUNDS[name])
+        name: inverse_sigmoid(bm.array(val), *PARAM_BOUNDS[name])
         for name, val in init_constrained.items()
     }
 
     # ---- Build loss and gradient functions ----
-    loss_fn = build_loss_fn(target_v_jnp, jnp.array(stimulus), dt)
-    grad_fn = jit(value_and_grad(loss_fn))
+    loss_fn = build_loss_fn(target_v_bm, bm.array(stimulus), dt)
+    # bm.grad with return_value=True returns (grads, loss_value)
+    # We wrap it to match the (loss_value, grads) convention used below
+    _grad_fn = bm.grad(loss_fn, return_value=True)
+    def grad_fn(params):
+        grads, loss_val = _grad_fn(params)
+        return loss_val, grads
+    grad_fn = bm.jit(grad_fn)
 
     # ---- Optimizer ----
     optimizer = optax.adam(lr)
@@ -471,7 +454,7 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
             break
 
         # Gradient clipping
-        grads = jax.tree.map(lambda g: jnp.clip(g, -10.0, 10.0), grads)
+        grads = {k: bm.clip(g, -10.0, 10.0) for k, g in grads.items()}
 
         updates, opt_state = optimizer.update(grads, opt_state)
         opt_params = optax.apply_updates(opt_params, updates)
@@ -479,7 +462,7 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
 
         if loss_val_float < best_loss:
             best_loss = loss_val_float
-            best_params = jax.tree.map(lambda x: x.copy(), opt_params)
+            best_params = {k: v.copy() for k, v in opt_params.items()}
 
         if epoch % 10 == 0 or epoch == epochs - 1:
             logger.info(f"    Epoch {epoch:4d}  loss={loss_val_float:.4f}  best={best_loss:.4f}")
@@ -504,9 +487,9 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
     ))
 
     # ---- Diagnostics ----
-    n = min(len(v_sim), len(target_v_jnp))
+    n = min(len(v_sim), len(target_v_bm))
     v_sim_trimmed = v_sim[:n]
-    target_trimmed = np.array(target_v_jnp[:n])
+    target_trimmed = np.array(target_v_bm[:n])
 
     spike_threshold = -20.0
     sim_spikes = np.sum(np.diff((v_sim_trimmed > spike_threshold).astype(int)) > 0)
