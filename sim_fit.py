@@ -1,43 +1,36 @@
 """
-BrainPy Baseline Fitter — Fixed Na+K+Leak HH Model (Weeks 3–4)
-================================================================
+Jaxley Baseline Fitter — Fixed Na+K+Leak HH Model (Weeks 3–4)
+==============================================================
 
 Fits a single-compartment Hodgkin-Huxley model (Na + K + Leak) to PV+
 fast-spiking interneuron recordings from the Allen Cell Types Database
-using BrainPy's differentiable simulation and gradient descent.
+using Jaxley's differentiable simulation and gradient descent.
 
-This is the "BrainPy fixed-HH" baseline — the simplest biophysical model
-that the agent-discovered models must beat.
-
-Usage:
-    python sim_fit.py --data-dir ./cell_types_data
-    python sim_fit.py --data-dir ./cell_types_data --specimen-id 469801138
-    python sim_fit.py --data-dir ./cell_types_data --epochs 200 --lr 0.01
-    python sim_fit.py --data-dir ./cell_types_data --all
-
-Requires:
-    pip install brainpy jax jaxlib optax allensdk matplotlib
-"""
-"""
-BrainPy Baseline Fitter — Fixed Na+K+Leak HH Model (Weeks 3–4)
-================================================================
-
-Fits a single-compartment Hodgkin-Huxley model (Na + K + Leak) to PV+
-fast-spiking interneuron recordings from the Allen Cell Types Database
-using BrainPy's differentiable simulation and gradient descent.
-
-This is the "BrainPy fixed-HH" baseline — the simplest biophysical model
-that the agent-discovered models must beat.
+This is the "Jaxley fixed-HH" baseline from the NASS proposal — the
+simplest biophysical model that the agent-discovered models must beat.
 
 Usage:
-    python sim_fit.py --data-dir ./cell_types_data
-    python sim_fit.py --data-dir ./cell_types_data --specimen-id 469801138
-    python sim_fit.py --data-dir ./cell_types_data --epochs 200 --lr 0.01
-    python sim_fit.py --data-dir ./cell_types_data --all
+    python jaxley_fit.py --data-dir ./cell_types_data
+    python jaxley_fit.py --data-dir ./cell_types_data --specimen-id 469801138
+    python jaxley_fit.py --data-dir ./cell_types_data --epochs 200 --lr 0.01
+    python jaxley_fit.py --data-dir ./cell_types_data --all  # fit all valid cells
 
 Requires:
-    pip install brainpy jax jaxlib optax allensdk matplotlib
+    pip install jaxley jax jaxlib optax allensdk matplotlib
+
+Output:
+    {data_dir}/fits/
+    ├── {specimen_id}/
+    │   ├── fit_result.json      — fitted parameters, losses, diagnostics
+    │   ├── trace_overlay.png    — simulated vs recorded voltage traces
+    │   └── loss_curve.png       — training loss over epochs
+    └── baseline_summary.csv     — comparison table across all fitted cells
 """
+
+# ---- JAX config must come before any JAX imports ----
+from jax import config
+config.update("jax_enable_x64", True)
+# config.update("jax_platform_name", "gpu")  # Uncomment if GPU available
 
 import os
 import json
@@ -46,19 +39,16 @@ import logging
 from pathlib import Path
 
 import numpy as np
-print(np.__version__)  # Must be 1.26.x
-#import xarray as xr
+import jax
+import jax.numpy as jnp
+from jax import jit, value_and_grad
 import optax
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-import brainpy as bp
-import brainpy.math as bm
-
-# ---- Enable 64-bit precision (must be called early) ----
-bm.enable_x64()
-# bm.set_platform("gpu")  # Uncomment if GPU available
+import jaxley as jx
+from jaxley.channels import Na, K, Leak
 
 from allensdk.core.cell_types_cache import CellTypesCache
 
@@ -89,10 +79,15 @@ def load_training_sweep(ctc: CellTypesCache, specimen_id: int,
     if not train_sweeps:
         raise ValueError(f"No training sweeps for specimen {specimen_id}")
 
+    # Sort by amplitude
     by_amp = sorted(train_sweeps, key=lambda s: s.get("stimulus_amplitude", 0) or 0)
+
+    # Find sweeps with spikes (num_spikes > 0)
     spiking = [sw for sw in by_amp if (sw.get("num_spikes") or 0) > 0]
 
     if not spiking:
+        # num_spikes metadata may be missing — check spike_times from NWB directly
+        # for the top few highest-amplitude sweeps
         logger.info("  num_spikes metadata unavailable; scanning NWB for spiking sweeps...")
         data_set = ctc.get_ephys_data(specimen_id)
         for sw in reversed(by_amp[-min(8, len(by_amp)):]):
@@ -103,9 +98,12 @@ def load_training_sweep(ctc: CellTypesCache, specimen_id: int,
                     spiking.append(sw)
             except Exception:
                 pass
+        # Re-sort spiking sweeps by amplitude
         spiking.sort(key=lambda s: s.get("stimulus_amplitude", 0) or 0)
 
     if spiking:
+        # Pick a sweep ~1/3 into the spiking range (above rheobase but
+        # not so high that we risk depolarization block)
         idx = min(len(spiking) - 1, max(1, len(spiking) // 3))
         chosen = spiking[idx]
         logger.info(
@@ -115,6 +113,7 @@ def load_training_sweep(ctc: CellTypesCache, specimen_id: int,
             f"index {idx}/{len(spiking)} spiking sweeps)"
         )
     else:
+        # Fallback: highest amplitude training sweep
         chosen = by_amp[-1]
         logger.warning(
             f"  No spiking sweeps found! Using highest amplitude sweep "
@@ -141,7 +140,10 @@ def load_training_sweep(ctc: CellTypesCache, specimen_id: int,
 
 def load_multiple_sweeps(ctc: CellTypesCache, specimen_id: int,
                          sweep_index: dict, n_sweeps: int = 3) -> list:
-    """Load multiple training sweeps spanning a range of amplitudes."""
+    """
+    Load multiple training sweeps spanning a range of amplitudes.
+    Returns a list of sweep dicts.
+    """
     cell_entry = sweep_index[str(specimen_id)]
     train_sweeps = cell_entry["split"]["training"]["long_square"]
 
@@ -150,6 +152,7 @@ def load_multiple_sweeps(ctc: CellTypesCache, specimen_id: int,
 
     by_amp = sorted(train_sweeps, key=lambda s: s.get("stimulus_amplitude", 0) or 0)
     n = min(n_sweeps, len(by_amp))
+    # Sample evenly across amplitude range
     indices = np.linspace(0, len(by_amp) - 1, n, dtype=int)
     selected = [by_amp[i] for i in indices]
 
@@ -169,173 +172,162 @@ def load_multiple_sweeps(ctc: CellTypesCache, specimen_id: int,
             "response": response,
             "sampling_rate": sr,
         })
+
     return results
 
 
 # ---------------------------------------------------------------------------
-# 2. BrainPy Model Builder — single-compartment Na+K+Leak
+# 2. Jaxley Model Builder — single-compartment Na+K+Leak
 # ---------------------------------------------------------------------------
 
-class FixedHHNeuron(bp.dyn.CondNeuGroupLTC):
-    """
-    Single-compartment HH neuron with Na, K, and Leak channels.
-    This is the fixed 3-channel baseline model.
-
-    BrainPy uses class composition: channels are attached as attributes
-    in __init__, and CondNeuGroupLTC automatically collects their currents.
-
-    Parameters use BrainPy's native units (mS/cm² for conductance,
-    uF/cm² for capacitance, mV for potentials).
-    """
-
-    def __init__(self, size, gNa=120.0, gK=36.0, gL=0.03, eLeak=-60.0,
-                 eNa=50.0, eK=-77.0, C=1.0):
-        super().__init__(
-            size,
-            C=C,
-            V_th=20.0,
-            V_initializer=bp.init.Constant(-65.0),
-        )
-        self.INa = bp.dyn.INa_HH1952(size, E=eNa, g_max=gNa)
-        self.IK = bp.dyn.IK_HH1952(size, E=eK, g_max=gK)
-        self.IL = bp.dyn.IL(size, E=eLeak, g_max=gL)
-
-
-def build_hh_cell(dt: float = 0.025) -> FixedHHNeuron:
+def build_hh_cell(dt: float = 0.025) -> jx.Compartment:
     """
     Build a single-compartment HH cell with Na, K, and Leak channels.
+    This is the fixed 3-channel baseline model.
 
-    Conductance densities are initialised for PV+ fast-spiking cells.
-    Uses BrainPy's native msiemens units (g_max in mS/cm²).
+    Geometry is set to approximate a PV+ fast-spiking interneuron soma
+    (~20 um diameter sphere → single compartment with equivalent area).
+    Conductance densities are initialised higher than squid-axon HH
+    to reflect the high channel density of fast-spiking cells.
     """
-    model = FixedHHNeuron(
-        size=1,
-        gNa=120.0,      # mS/cm² — standard HH (high for FS cells)
-        gK=36.0,         # mS/cm²
-        gL=0.03,         # mS/cm²
-        eLeak=-60.0,     # mV
-        eNa=50.0,        # mV
-        eK=-77.0,        # mV
-        C=1.0,           # uF/cm²
-    )
-    return model
+    comp = jx.Compartment()
+    comp.insert(Na())
+    comp.insert(K())
+    comp.insert(Leak())
+
+    # Soma geometry: ~20 um diameter sphere
+    # For a sphere of diameter d, surface area = pi*d^2
+    # Jaxley compartment area = 2*pi*radius*length
+    # Set radius=10, length=10*pi ≈ 31.4 so area ≈ pi*(20)^2 ≈ 1257 um^2
+    comp.set("radius", 10.0)           # um
+    comp.set("length", 31.4)           # um (gives sphere-like area)
+    comp.set("axial_resistivity", 100.0)  # ohm*cm
+    comp.set("capacitance", 1.0)       # uF/cm^2
+
+    # Channel conductances — PV+ FS interneurons have very high Na/K density
+    comp.set("Na_gNa", 0.5)           # S/cm^2 (high for FS cells)
+    comp.set("K_gK", 0.2)             # S/cm^2 (high for FS cells)
+    comp.set("Leak_gLeak", 0.001)     # S/cm^2
+
+    # Reversal potentials (eNa and eK are global, not channel-prefixed)
+    comp.set("eNa", 50.0)             # mV
+    comp.set("eK", -77.0)             # mV
+    comp.set("Leak_eLeak", -60.0)     # mV
+
+    return comp
 
 
-# ---------------------------------------------------------------------------
-# 2b. Stimulus and Target preparation
-# ---------------------------------------------------------------------------
-
-def prepare_stimulus(sweep: dict, dt: float = 0.025) -> tuple:
+def prepare_stimulus(sweep: dict, dt: float = 0.025) -> np.ndarray:
     """
-    Resample Allen stimulus to BrainPy's simulation timestep.
-    Allen stimulus is in Amps; BrainPy expects nA for external current.
+    Resample the Allen stimulus waveform to Jaxley's simulation timestep.
+    Allen recordings are typically at 200 kHz; Jaxley uses dt in ms.
+
+    Allen stimulus is in Amps; Jaxley expects nA.
     """
     sr = sweep["sampling_rate"]
     stimulus_amps = sweep["stimulus"]
+
+    # Convert A -> nA
     stimulus_nA = stimulus_amps * 1e9
 
-    t_allen = np.arange(len(stimulus_nA)) / sr
+    # Compute time vectors
+    t_allen = np.arange(len(stimulus_nA)) / sr  # seconds
     t_max_s = t_allen[-1]
     t_max_ms = t_max_s * 1000.0
 
+    # Jaxley time in ms
     n_steps = int(t_max_ms / dt) + 1
-    t_sim_ms = np.arange(n_steps) * dt
-    t_sim_s = t_sim_ms / 1000.0
+    t_jaxley_ms = np.arange(n_steps) * dt
+    t_jaxley_s = t_jaxley_ms / 1000.0
 
-    stimulus_resampled = np.interp(t_sim_s, t_allen, stimulus_nA)
+    # Resample stimulus to Jaxley timestep via interpolation
+    stimulus_resampled = np.interp(t_jaxley_s, t_allen, stimulus_nA)
+
     return stimulus_resampled, t_max_ms
 
 
 def prepare_target(sweep: dict, dt: float = 0.025) -> np.ndarray:
     """
-    Resample Allen voltage response to BrainPy's simulation timestep.
-    Allen response is in Volts; BrainPy uses mV.
+    Resample the Allen voltage response to Jaxley's simulation timestep.
+    Allen response is in Volts; Jaxley uses mV.
     """
     sr = sweep["sampling_rate"]
     response_V = sweep["response"]
+
+    # Convert V -> mV
     response_mV = response_V * 1e3
 
-    t_allen = np.arange(len(response_V)) / sr
+    t_allen = np.arange(len(response_V)) / sr  # seconds
     t_max_s = t_allen[-1]
     t_max_ms = t_max_s * 1000.0
 
     n_steps = int(t_max_ms / dt) + 1
-    t_sim_ms = np.arange(n_steps) * dt
-    t_sim_s = t_sim_ms / 1000.0
+    t_jaxley_ms = np.arange(n_steps) * dt
+    t_jaxley_s = t_jaxley_ms / 1000.0
 
-    response_resampled = np.interp(t_sim_s, t_allen, response_mV)
+    response_resampled = np.interp(t_jaxley_s, t_allen, response_mV)
+
     return response_resampled
 
 
 # ---------------------------------------------------------------------------
 # 3. Simulation & Loss Functions
 # ---------------------------------------------------------------------------
-# BrainPy simulation approach:
-#   1. Build a FixedHHNeuron with given parameters and run via bp.DSRunner.
-#   2. Parameters are stored as a flat dict of bm arrays in unconstrained
-#      space, mapped to biophysical bounds via sigmoid_transform.
-#   3. bm.grad(fn, return_value=True) differentiates through the simulation.
 
-def sigmoid_transform(x, lower, upper):
-    """Map unconstrained value x to (lower, upper) via sigmoid."""
-    return lower + (upper - lower) * (1.0 / (1.0 + bm.exp(-x)))
-
-
-def inverse_sigmoid(y, lower, upper):
-    """Map constrained value y in (lower, upper) to unconstrained space."""
-    p = (y - lower) / (upper - lower)
-    p = bm.clip(p, 1e-6, 1.0 - 1e-6)
-    return bm.log(p / (1.0 - p))
-
-
-# Parameter bounds — biophysically reasonable ranges for PV+ FS cells
-PARAM_BOUNDS = {
-    "gNa":   (10.0, 500.0),     # mS/cm² — FS cells have high Na density
-    "gK":    (5.0, 200.0),      # mS/cm²
-    "gL":    (0.001, 5.0),      # mS/cm²
-    "eLeak": (-80.0, -40.0),    # mV
-    "C":     (0.5, 3.0),        # uF/cm²
-    "eNa":   (30.0, 70.0),      # mV
-    "eK":    (-100.0, -60.0),   # mV
-}
-
-
-def run_simulation(gNa, gK, gL, eLeak, C, eNa, eK, stimulus, dt):
+def setup_simulation(cell: jx.Compartment, stimulus: np.ndarray,
+                     dt: float = 0.025, t_max: float = None):
     """
-    Run a BrainPy HH simulation with given parameters.
+    Configure stimulus injection and recording on the cell.
+    stimulus: 1D array of current values in nA, one per Jaxley timestep.
 
-    Builds the model with the given parameters each call so that
-    the computation is fully traceable and differentiable.
+    Uses cell.stimulate() which registers the stimulus persistently,
+    so jx.integrate() knows the simulation duration.
     """
-    model = FixedHHNeuron(size=1, gNa=gNa, gK=gK, gL=gL,
-                          eLeak=eLeak, eNa=eNa, eK=eK, C=C)
+    cell.delete_stimuli()
+    cell.delete_recordings()
 
-    runner = bp.DSRunner(model, monitors=['V'], dt=dt)
-    runner.run(inputs=stimulus)
-    v = bm.as_numpy(runner.mon['V'])
-    return v.flatten()
+    # Inject the full stimulus waveform using .stimulate()
+    # stimulus must be shape (n_timesteps,) — Jaxley infers duration from it
+    i_ext = jnp.array(stimulus)
+    cell.stimulate(i_ext)
+
+    # Record membrane voltage
+    cell.record("v")
+
+    return cell
 
 
-def build_loss_fn(target_v, stimulus, dt):
+def build_loss_fn(cell, target_v, dt, transform):
     """
-    Build a differentiable loss function.
+    Build a differentiable loss function that:
+    1. Takes optimizable parameters
+    2. Sets them on the cell via data_set
+    3. Runs Jaxley simulation
+    4. Computes MSE between simulated and recorded voltage
 
-    Takes unconstrained parameters, transforms them to biophysical
-    bounds via sigmoid, runs the BrainPy simulation, and returns MSE.
+    The loss combines:
+    - Waveform MSE (primary)
+    - Penalty for non-physiological resting potential
     """
 
     def loss_fn(opt_params):
         # Transform from unconstrained -> constrained parameter space
-        gNa   = sigmoid_transform(opt_params["gNa"],   *PARAM_BOUNDS["gNa"])
-        gK    = sigmoid_transform(opt_params["gK"],    *PARAM_BOUNDS["gK"])
-        gL    = sigmoid_transform(opt_params["gL"],    *PARAM_BOUNDS["gL"])
-        eLeak = sigmoid_transform(opt_params["eLeak"], *PARAM_BOUNDS["eLeak"])
-        C     = sigmoid_transform(opt_params["C"],     *PARAM_BOUNDS["C"])
-        eNa   = sigmoid_transform(opt_params["eNa"],   *PARAM_BOUNDS["eNa"])
-        eK    = sigmoid_transform(opt_params["eK"],    *PARAM_BOUNDS["eK"])
+        params = transform.forward(opt_params)
+
+        # Set parameters on the cell
+        param_state = None
+        param_state = cell.data_set("Na_gNa", params[0]["Na_gNa"], param_state)
+        param_state = cell.data_set("K_gK", params[1]["K_gK"], param_state)
+        param_state = cell.data_set("Leak_gLeak", params[2]["Leak_gLeak"], param_state)
+        param_state = cell.data_set("Leak_eLeak", params[3]["Leak_eLeak"], param_state)
+        param_state = cell.data_set("capacitance", params[4]["capacitance"], param_state)
+        param_state = cell.data_set("eNa", params[5]["eNa"], param_state)
+        param_state = cell.data_set("eK", params[6]["eK"], param_state)
+        param_state = cell.data_set("radius", params[7]["radius"], param_state)
 
         # Run simulation
-        v_sim = run_simulation(gNa, gK, gL, eLeak, C, eNa, eK, stimulus, dt)
+        v = jx.integrate(cell, param_state=param_state, delta_t=dt)
+        v_sim = v[0]  # shape: (n_timesteps,)
 
         # Trim to match target length
         n = min(len(v_sim), len(target_v))
@@ -343,7 +335,8 @@ def build_loss_fn(target_v, stimulus, dt):
         v_target_trimmed = target_v[:n]
 
         # Waveform MSE loss
-        mse = bm.mean((v_sim_trimmed - v_target_trimmed) ** 2)
+        mse = jnp.mean((v_sim_trimmed - v_target_trimmed) ** 2)
+
         return mse
 
     return loss_fn
@@ -372,7 +365,7 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
     sweep = load_training_sweep(ctc, specimen_id, sweep_index)
     stimulus, t_max = prepare_stimulus(sweep, dt)
     target_v = prepare_target(sweep, dt)
-    target_v_bm = bm.array(target_v)
+    target_v_jnp = jnp.array(target_v)
 
     logger.info(
         f"  Sweep {sweep['sweep_number']}: "
@@ -381,54 +374,78 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
         f"target range [{target_v.min():.1f}, {target_v.max():.1f}] mV"
     )
 
-    # ---- Window to stimulus region ----
-    max_duration_ms = 1200.0
+    # ---- Find the active stimulus window and extract around it ----
+    # Allen long-square traces are ~5s with the current step starting ~1s in.
+    # We need to include the stimulus period, not just the pre-stimulus baseline.
+    # Strategy: find where stimulus is significantly non-zero, then take a window
+    # starting slightly before stimulus onset.
+    max_duration_ms = 1200.0  # enough for stimulus + some baseline
     stim_np = np.array(stimulus)
-    stim_threshold = np.max(np.abs(stim_np)) * 0.1
+    stim_threshold = np.max(np.abs(stim_np)) * 0.1  # 10% of peak
     active_indices = np.where(np.abs(stim_np) > stim_threshold)[0]
 
     if len(active_indices) > 0:
+        # Start 50ms before stimulus onset, end 100ms after stimulus offset
         pre_pad = int(50.0 / dt)
         post_pad = int(100.0 / dt)
         start_idx = max(0, active_indices[0] - pre_pad)
         end_idx = min(len(stim_np), active_indices[-1] + post_pad)
+
+        # Cap total duration
         max_samples = int(max_duration_ms / dt) + 1
         if (end_idx - start_idx) > max_samples:
             end_idx = start_idx + max_samples
+
         stimulus = stimulus[start_idx:end_idx]
-        target_v_bm = target_v_bm[start_idx:end_idx]
+        target_v_jnp = target_v_jnp[start_idx:end_idx]
         t_max = len(stimulus) * dt
         logger.info(
             f"  Windowed to stimulus region: {start_idx*dt:.0f}–{end_idx*dt:.0f} ms "
-            f"({len(stimulus)} timesteps, {t_max:.0f} ms)"
+            f"({len(stimulus)} timesteps, {t_max:.0f} ms), "
+            f"target range [{float(target_v_jnp.min()):.1f}, {float(target_v_jnp.max()):.1f}] mV"
         )
     elif t_max > max_duration_ms:
         n_keep = int(max_duration_ms / dt) + 1
         stimulus = stimulus[:n_keep]
-        target_v_bm = target_v_bm[:n_keep]
+        target_v_jnp = target_v_jnp[:n_keep]
         t_max = max_duration_ms
         logger.info(f"  No clear stimulus found; truncated to first {max_duration_ms:.0f} ms")
 
-    # ---- Initial parameters in unconstrained space ----
-    # Start from biophysically reasonable initial values
-    init_constrained = {
-        "gNa": 120.0, "gK": 36.0, "gL": 0.03,
-        "eLeak": -60.0, "C": 1.0, "eNa": 50.0, "eK": -77.0,
-    }
-    opt_params = {
-        name: inverse_sigmoid(bm.array(val), *PARAM_BOUNDS[name])
-        for name, val in init_constrained.items()
-    }
+    # ---- Build model ----
+    cell = build_hh_cell(dt)
+    cell = setup_simulation(cell, stimulus, dt, t_max)
+
+    # ---- Make parameters trainable with bounds ----
+    # Conductances (S/cm^2), reversal (mV), capacitance (uF/cm^2)
+    cell.make_trainable("Na_gNa")
+    cell.make_trainable("K_gK")
+    cell.make_trainable("Leak_gLeak")
+    cell.make_trainable("Leak_eLeak")
+    cell.make_trainable("capacitance")
+    cell.make_trainable("eNa")
+    cell.make_trainable("eK")
+    cell.make_trainable("radius")
+
+    opt_params = cell.get_parameters()
+
+    # Sigmoid transforms to keep parameters in biophysical bounds
+    from jaxley.optimize.transforms import ParamTransform, SigmoidTransform
+
+    transforms = [
+        {"Na_gNa": SigmoidTransform(lower=0.05, upper=5.0)},    # FS cells can be very high
+        {"K_gK": SigmoidTransform(lower=0.01, upper=2.0)},      # also high for FS
+        {"Leak_gLeak": SigmoidTransform(lower=1e-5, upper=0.05)},
+        {"Leak_eLeak": SigmoidTransform(lower=-80.0, upper=-40.0)},
+        {"capacitance": SigmoidTransform(lower=0.5, upper=3.0)},
+        {"eNa": SigmoidTransform(lower=30.0, upper=70.0)},
+        {"eK": SigmoidTransform(lower=-100.0, upper=-60.0)},
+        {"radius": SigmoidTransform(lower=3.0, upper=30.0)},    # controls effective area
+    ]
+    transform = ParamTransform(transforms)
 
     # ---- Build loss and gradient functions ----
-    loss_fn = build_loss_fn(target_v_bm, bm.array(stimulus), dt)
-    # bm.grad with return_value=True returns (grads, loss_value)
-    # We wrap it to match the (loss_value, grads) convention used below
-    _grad_fn = bm.grad(loss_fn, return_value=True)
-    def grad_fn(params):
-        grads, loss_val = _grad_fn(params)
-        return loss_val, grads
-    grad_fn = bm.jit(grad_fn)
+    loss_fn = build_loss_fn(cell, target_v_jnp, dt, transform)
+    grad_fn = jit(value_and_grad(loss_fn))
 
     # ---- Optimizer ----
     optimizer = optax.adam(lr)
@@ -449,12 +466,15 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
             logger.error(f"  Epoch {epoch}: simulation failed — {e}")
             break
 
+        # Check for NaN
         if np.isnan(loss_val_float):
             logger.warning(f"  Epoch {epoch}: NaN loss, stopping")
             break
 
-        # Gradient clipping
-        grads = {k: bm.clip(g, -10.0, 10.0) for k, g in grads.items()}
+        # Gradient clipping to prevent instability
+        grads = jax.tree.map(
+            lambda g: jnp.clip(g, -10.0, 10.0), grads
+        )
 
         updates, opt_state = optimizer.update(grads, opt_state)
         opt_params = optax.apply_updates(opt_params, updates)
@@ -462,7 +482,7 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
 
         if loss_val_float < best_loss:
             best_loss = loss_val_float
-            best_params = {k: v.copy() for k, v in opt_params.items()}
+            best_params = jax.tree.map(lambda x: x.copy(), opt_params)
 
         if epoch % 10 == 0 or epoch == epochs - 1:
             logger.info(f"    Epoch {epoch:4d}  loss={loss_val_float:.4f}  best={best_loss:.4f}")
@@ -472,28 +492,46 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
         logger.error(f"  No valid parameters found for {specimen_id}")
         return {"specimen_id": specimen_id, "success": False}
 
+    fitted = transform.forward(best_params)
     fitted_dict = {
-        name: float(sigmoid_transform(best_params[name], *PARAM_BOUNDS[name]))
-        for name in best_params
+        "Na_gNa": float(fitted[0]["Na_gNa"][0]),
+        "K_gK": float(fitted[1]["K_gK"][0]),
+        "Leak_gLeak": float(fitted[2]["Leak_gLeak"][0]),
+        "Leak_eLeak": float(fitted[3]["Leak_eLeak"][0]),
+        "capacitance": float(fitted[4]["capacitance"][0]),
+        "eNa": float(fitted[5]["eNa"][0]),
+        "eK": float(fitted[6]["eK"][0]),
+        "radius": float(fitted[7]["radius"][0]),
     }
+
     logger.info(f"  Fitted parameters: {fitted_dict}")
     logger.info(f"  Best loss: {best_loss:.4f}")
 
     # ---- Run final simulation with best params ----
-    v_sim = np.array(run_simulation(
-        fitted_dict["gNa"], fitted_dict["gK"], fitted_dict["gL"],
-        fitted_dict["eLeak"], fitted_dict["C"], fitted_dict["eNa"],
-        fitted_dict["eK"], np.array(stimulus), dt
-    ))
+    param_state = None
+    param_state = cell.data_set("Na_gNa", fitted[0]["Na_gNa"], param_state)
+    param_state = cell.data_set("K_gK", fitted[1]["K_gK"], param_state)
+    param_state = cell.data_set("Leak_gLeak", fitted[2]["Leak_gLeak"], param_state)
+    param_state = cell.data_set("Leak_eLeak", fitted[3]["Leak_eLeak"], param_state)
+    param_state = cell.data_set("capacitance", fitted[4]["capacitance"], param_state)
+    param_state = cell.data_set("eNa", fitted[5]["eNa"], param_state)
+    param_state = cell.data_set("eK", fitted[6]["eK"], param_state)
+    param_state = cell.data_set("radius", fitted[7]["radius"], param_state)
+
+    v_final = jx.integrate(cell, param_state=param_state, delta_t=dt)
+    v_sim = np.array(v_final[0])
 
     # ---- Diagnostics ----
-    n = min(len(v_sim), len(target_v_bm))
+    n = min(len(v_sim), len(target_v_jnp))
     v_sim_trimmed = v_sim[:n]
-    target_trimmed = np.array(target_v_bm[:n])
+    target_trimmed = np.array(target_v_jnp[:n])
 
-    spike_threshold = -20.0
+    # Does the model spike?
+    spike_threshold = -20.0  # mV
     sim_spikes = np.sum(np.diff((v_sim_trimmed > spike_threshold).astype(int)) > 0)
     target_spikes = np.sum(np.diff((target_trimmed > spike_threshold).astype(int)) > 0)
+
+    # Correlation
     corr = np.corrcoef(v_sim_trimmed, target_trimmed)[0, 1]
 
     diagnostics = {
@@ -504,6 +542,7 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
         "pearson_correlation": float(corr) if not np.isnan(corr) else 0.0,
         "final_mse": float(best_loss),
     }
+
     logger.info(f"  Diagnostics: {diagnostics}")
 
     # ---- Save results ----
@@ -543,6 +582,7 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
     ax.legend(loc="upper right")
     ax.set_xlim(0, t_ms[-1])
 
+    # Stimulus trace
     ax2 = axes[1]
     stim_trimmed = np.array(stimulus[:n])
     ax2.plot(t_ms, stim_trimmed, color="steelblue", linewidth=0.8)
@@ -576,7 +616,9 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
 def run_baseline_fits(data_dir: str, specimen_id: int = None,
                       fit_all: bool = False, dt: float = 0.025,
                       epochs: int = 100, lr: float = 0.02):
-    """Run baseline HH fits for one or all valid PV+ cells."""
+    """
+    Run baseline HH fits for one or all valid PV+ cells.
+    """
     data_dir = Path(data_dir)
     output_dir = data_dir / "fits"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -586,12 +628,14 @@ def run_baseline_fits(data_dir: str, specimen_id: int = None,
     with open(data_dir / "sweep_index.json") as f:
         sweep_index = json.load(f)
 
+    # Get valid cell IDs
     valid_ids = [
         int(sid) for sid, entry in sweep_index.items()
         if entry.get("valid", False)
     ]
     logger.info(f"Found {len(valid_ids)} valid cells in sweep_index.json")
 
+    # Select which cells to fit
     if specimen_id:
         if specimen_id not in valid_ids:
             logger.error(f"Specimen {specimen_id} not in valid cells")
@@ -600,15 +644,19 @@ def run_baseline_fits(data_dir: str, specimen_id: int = None,
     elif fit_all:
         ids_to_fit = valid_ids
     else:
+        # Default: fit the first valid cell
         ids_to_fit = [valid_ids[0]]
 
     logger.info(f"Will fit {len(ids_to_fit)} cell(s)")
 
+    # Run fits
     results = []
     for sid in ids_to_fit:
         try:
-            result = fit_cell(ctc, sid, sweep_index, output_dir,
-                              dt=dt, epochs=epochs, lr=lr)
+            result = fit_cell(
+                ctc, sid, sweep_index, output_dir,
+                dt=dt, epochs=epochs, lr=lr
+            )
             results.append(result)
         except Exception as e:
             logger.error(f"Failed to fit specimen {sid}: {e}")
@@ -631,8 +679,8 @@ def run_baseline_fits(data_dir: str, specimen_id: int = None,
                 f"{r['specimen_id']:<12} {'OK':<8} "
                 f"{d['final_mse']:<10.2f} {d['pearson_correlation']:<8.3f} "
                 f"{d['n_sim_spikes']:<12} {d['n_target_spikes']:<12} "
-                f"{p['gNa']:<8.1f} {p['gK']:<8.1f} "
-                f"{p['gL']:<10.4f} {p['eLeak']:<8.1f}"
+                f"{p['Na_gNa']:<8.4f} {p['K_gK']:<8.4f} "
+                f"{p['Leak_gLeak']:<10.6f} {p['Leak_eLeak']:<8.1f}"
             )
         else:
             print(f"{r['specimen_id']:<12} {'FAIL':<8} — {r.get('error', 'unknown')}")
@@ -645,7 +693,7 @@ def run_baseline_fits(data_dir: str, specimen_id: int = None,
         writer.writerow([
             "specimen_id", "success", "mse", "pearson_r",
             "n_sim_spikes", "n_target_spikes",
-            "gNa", "gK", "gL", "eLeak", "C"
+            "Na_gNa", "K_gK", "Leak_gLeak", "Leak_eLeak", "capacitance"
         ])
         for r in results:
             if r.get("success"):
@@ -654,8 +702,8 @@ def run_baseline_fits(data_dir: str, specimen_id: int = None,
                 writer.writerow([
                     r["specimen_id"], True, d["final_mse"],
                     d["pearson_correlation"], d["n_sim_spikes"],
-                    d["n_target_spikes"], p["gNa"], p["gK"],
-                    p["gL"], p["eLeak"], p["C"]
+                    d["n_target_spikes"], p["Na_gNa"], p["K_gK"],
+                    p["Leak_gLeak"], p["Leak_eLeak"], p["capacitance"]
                 ])
             else:
                 writer.writerow([r["specimen_id"], False] + [""] * 9)
@@ -670,11 +718,11 @@ def run_baseline_fits(data_dir: str, specimen_id: int = None,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Fit fixed Na+K+Leak HH model to Allen PV+ neurons via BrainPy"
+        description="Fit fixed Na+K+Leak HH model to Allen PV+ neurons via Jaxley"
     )
     parser.add_argument(
         "--data-dir", type=str, default="cell_types_data",
-        help="Path to Allen data cache (from allen_downloader.py)"
+        help="Path to Allen data cache (from allen_pv_pipeline.py)"
     )
     parser.add_argument(
         "--specimen-id", type=int, default=None,
@@ -690,11 +738,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--lr", type=float, default=0.02,
-        help="Adam learning rate (default: 0.02)"
+        help="Adam learning rate (default: 0.005)"
     )
     parser.add_argument(
         "--dt", type=float, default=0.025,
-        help="BrainPy simulation timestep in ms (default: 0.025)"
+        help="Jaxley simulation timestep in ms (default: 0.025)"
     )
 
     args = parser.parse_args()

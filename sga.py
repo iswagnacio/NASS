@@ -13,7 +13,7 @@ Core components:
     5. Prompt templates — neuroscience-specific prompts for the LLM
 
 The key insight from the proposal: "SGA gives us ~70% of the infrastructure.
-We replace its material-science simulation backend with Jaxley's neuron ODE
+We replace its material-science simulation backend with BrainPy's neuron ODE
 solver, replace its constitutive-law templates with HH equation templates,
 and point it at Allen patch-clamp data instead of material deformation data."
 
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 class ModelProposal:
     """
     A proposed HH-type model structure. This is what the LLM generates
-    and what gets passed to the Jaxley inner loop.
+    and what gets passed to the BrainPy inner loop.
     """
     # Identity
     proposal_id: int = 0
@@ -82,36 +82,56 @@ class ModelProposal:
     def __lt__(self, other):
         return self.loss < other.loss
 
-    def to_jaxley_code(self) -> str:
-        """Generate Jaxley-compatible Python code for this model."""
+    def to_brainpy_code(self) -> str:
+        """Generate BrainPy-compatible Python code for this model."""
         lines = [
-            "import jaxley as jx",
-            "from jaxley.channels import Na, K, Leak",
+            "import brainpy as bp",
+            "import brainpy.math as bm",
             "from channels import Kv3, IM, IAHP, IT, ICaL, IH",
             "",
-            "comp = jx.Compartment()",
+            "class ProposedNeuron(bp.dyn.CondNeuGroupLTC):",
+            "    def __init__(self, size, **kwargs):",
+            "        super().__init__(",
+            f"            size, C={self.capacitance},",
+            "            V_th=20.0,",
+            "            V_initializer=bp.init.Constant(-65.0),",
+            "        )",
         ]
 
-        # Map channel names to import sources
-        builtin = {"Na", "K", "Leak"}
-        custom = {"Kv3", "IM", "IAHP", "IT", "ICaL", "IH"}
+        # Map channel names to BrainPy channel classes
+        # BrainPy built-in HH channels use bp.dyn.* classes
+        channel_map = {
+            "Na":   ("INa", "bp.dyn.INa_HH1952"),
+            "K":    ("IK",  "bp.dyn.IK_HH1952"),
+            "Leak": ("IL",  "bp.dyn.IL"),
+        }
+        # Custom channels are imported from the channels module
+        custom_channels = {"Kv3", "IM", "IAHP", "IT", "ICaL", "IH"}
 
         for ch in self.channels:
-            if ch in builtin or ch in custom:
-                lines.append(f"comp.insert({ch}())")
+            if ch in channel_map:
+                attr_name, cls_name = channel_map[ch]
+                # Look up init params from param_config if available
+                g_key = f"{ch}_g{ch}"
+                g_init = self.param_config.get(g_key, {}).get("init")
+                if g_init is not None:
+                    lines.append(f"        self.{attr_name} = {cls_name}(size, g_max={g_init})")
+                else:
+                    lines.append(f"        self.{attr_name} = {cls_name}(size)")
+            elif ch in custom_channels:
+                g_key = f"{ch}_g{ch}"
+                g_init = self.param_config.get(g_key, {}).get("init")
+                if g_init is not None:
+                    lines.append(f"        self.I{ch} = {ch}(size, g_max={g_init})")
+                else:
+                    lines.append(f"        self.I{ch} = {ch}(size)")
             else:
-                lines.append(f"# Unknown channel: {ch}")
+                lines.append(f"        # Unknown channel: {ch}")
 
         lines.extend([
-            f"",
-            f"comp.set('radius', {self.radius})",
-            f"comp.set('length', {self.length})",
-            f"comp.set('capacitance', {self.capacitance})",
-            f"comp.set('axial_resistivity', 100.0)",
+            "",
+            "model = ProposedNeuron(size=1)",
         ])
-
-        for param_name, config in self.param_config.items():
-            lines.append(f"comp.set('{param_name}', {config.get('init', 0.001)})")
 
         return "\n".join(lines)
 
@@ -278,16 +298,16 @@ class DiagnosticReport:
 
 SYSTEM_PROMPT = """You are a computational neuroscience expert specialising in
 Hodgkin-Huxley-type biophysical models of cortical neurons. You are working with
-the Jaxley differentiable simulation framework to discover optimal HH model
+the BrainPy differentiable simulation framework to discover optimal HH model
 structures for specific cortical neuron types from the Allen Cell Types Database.
 
 Your task is to propose and iteratively refine the ion channel composition of
 single-compartment neuron models. You have access to these channels:
 
-BUILT-IN (Jaxley):
-- Na: Standard Hodgkin-Huxley sodium channel (fast transient)
-- K: Standard HH delayed rectifier potassium channel
-- Leak: Passive leak conductance
+BUILT-IN (BrainPy):
+- Na: Standard Hodgkin-Huxley sodium channel (fast transient) — bp.dyn.INa_HH1952
+- K: Standard HH delayed rectifier potassium channel — bp.dyn.IK_HH1952
+- Leak: Passive leak conductance — bp.dyn.IL
 
 CUSTOM LIBRARY:
 - Kv3: Fast delayed rectifier K+ (Kv3/Shaw). Enables high-frequency firing in PV+ FS cells.
@@ -367,7 +387,7 @@ class OuterLoop:
     """
     The SGA-style outer loop that orchestrates:
     1. LLM proposes model structure (or revises based on feedback)
-    2. Inner loop (Jaxley gradient descent) optimises parameters
+    2. Inner loop (BrainPy gradient descent) optimises parameters
     3. Diagnostics generated from fitting results
     4. Results pushed to top-K heap
     5. LLM receives feedback and proposes revision
@@ -450,11 +470,11 @@ class OuterLoop:
 
     def _run_inner_loop(self, proposal: ModelProposal) -> DiagnosticReport:
         """
-        Run the Jaxley inner loop for a proposal.
+        Run the BrainPy inner loop for a proposal.
 
         Calls general_fit.fit_proposal() which dynamically builds a
-        Jaxley cell from the proposal's channel list, runs gradient descent,
-        and returns a DiagnosticReport with real fitting results.
+        BrainPy neuron from the proposal's channel list, runs gradient
+        descent, and returns a DiagnosticReport with real fitting results.
         """
         logger.info(f"  Inner loop for proposal #{proposal.proposal_id}: "
                     f"{proposal.channels}")
@@ -596,5 +616,5 @@ if __name__ == "__main__":
         radius=15.0,
         rationale="PV+ FS cell needs Kv3 for fast repolarisation",
     )
-    print("\nGenerated Jaxley code:")
-    print(p.to_jaxley_code())
+    print("\nGenerated BrainPy code:")
+    print(p.to_brainpy_code())
