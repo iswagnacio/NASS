@@ -29,8 +29,8 @@ Output:
 
 # ---- JAX config must come before any JAX imports ----
 from jax import config
-config.update("jax_enable_x64", True)
-# config.update("jax_platform_name", "gpu")  # Uncomment if GPU available
+config.update("jax_enable_x64", False)
+config.update("jax_platform_name", "METAL")
 
 import os
 import json
