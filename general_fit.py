@@ -86,7 +86,7 @@ ALL_CHANNELS = {**BUILTIN_CHANNELS, **CUSTOM_CHANNELS}
 # shifting reversal potentials to extremes instead of learning to spike).
 DEFAULT_PARAM_BOUNDS = {
     # Conductances — wide enough for FS cells
-    "Na_gNa":       {"init": 0.5,   "lower": 0.05,  "upper": 5.0},
+    "Na_gNa":       {"init": 0.5,   "lower": 0.05,  "upper": 15.0},
     "K_gK":         {"init": 0.2,   "lower": 0.01,  "upper": 2.0},
     "Leak_gLeak":   {"init": 0.001, "lower": 1e-5,  "upper": 0.01},
     "Leak_eLeak":   {"init": -65.0, "lower": -75.0, "upper": -50.0},
@@ -98,7 +98,7 @@ DEFAULT_PARAM_BOUNDS = {
     "ICaL_gCaL":    {"init": 1e-4,  "lower": 1e-5,  "upper": 1e-2},
     "IH_gH":        {"init": 1e-5,  "lower": 1e-6,  "upper": 1e-3},
     # Reversal potentials — tighter to prevent optimizer cheating
-    "eNa":          {"init": 50.0,  "lower": 40.0,  "upper": 60.0},
+    "eNa":          {"init": 50.0,  "lower": 40.0,  "upper": 70.0},
     "eK":           {"init": -77.0, "lower": -90.0, "upper": -70.0},
     # Geometry — tighter radius prevents current dilution
     "capacitance":  {"init": 1.0,   "lower": 0.5,   "upper": 2.0},
@@ -516,28 +516,49 @@ def fit_proposal(
     # ------------------------------------------------------------------
     # Step 4: Build loss function and run gradient descent
     # ------------------------------------------------------------------
+    param_names = [t["name"] for t in trainable]
+    logger.info(f"  Trainable parameters ({len(param_names)}): {param_names}")
+ 
     loss_fn = build_generalized_loss_fn(cell, target_v_jnp, dt, transform, param_names)
-
-    optimizer = optax.adam(lr)
+ 
+    # --- Cosine LR schedule with linear warmup ---
+    warmup_epochs = min(20, epochs // 10)
+    schedule = optax.join_schedules(
+        schedules=[
+            optax.linear_schedule(init_value=lr * 0.1, end_value=lr,
+                                  transition_steps=warmup_epochs),
+            optax.cosine_decay_schedule(init_value=lr,
+                                        decay_steps=epochs - warmup_epochs,
+                                        alpha=0.01),  # decays to 1% of peak LR
+        ],
+        boundaries=[warmup_epochs],
+    )
+ 
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(5.0),   # tighter global norm clipping
+        optax.adam(learning_rate=schedule),
+    )
     opt_state = optimizer.init(opt_params)
-
-    # JIT-compiled training step with gradient clipping
+ 
+    # JIT-compiled training step (no per-element clipping — handled by chain above)
     @jit
     def step(params, opt_state):
         loss_val, grads = value_and_grad(loss_fn)(params)
-        grads = jax.tree.map(lambda g: jnp.clip(g, -10.0, 10.0), grads)
-        updates, new_opt_state = optimizer.update(grads, opt_state)
+        updates, new_opt_state = optimizer.update(grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, loss_val
-
+ 
     losses = []
     best_loss = float("inf")
     best_params = None
     nan_count = 0
-    max_nan = 5  # stop after this many consecutive NaN epochs
-
-    logger.info(f"  Starting optimisation: {epochs} epochs, lr={lr}")
-
+    max_nan = 5
+    patience = 50            # stop if no improvement for this many epochs
+    epochs_since_best = 0
+    divergence_threshold = 3.0  # rollback if loss > best * this factor
+ 
+    logger.info(f"  Starting optimisation: {epochs} epochs, lr={lr} (cosine schedule)")
+ 
     for epoch in range(epochs):
         try:
             opt_params, opt_state, loss_val = step(opt_params, opt_state)
@@ -548,29 +569,58 @@ def fit_proposal(
             if nan_count >= max_nan:
                 logger.error(f"  {max_nan} consecutive failures, stopping")
                 break
+            # Rollback to best params on exception
+            if best_params is not None:
+                opt_params = jax.tree.map(lambda x: x.copy(), best_params)
+                opt_state = optimizer.init(opt_params)
             continue
-
+ 
         if np.isnan(loss_float) or np.isinf(loss_float):
             nan_count += 1
             if nan_count >= max_nan:
                 logger.warning(f"  {max_nan} consecutive NaN/inf, stopping")
                 break
+            # Rollback to best params on NaN
+            if best_params is not None:
+                opt_params = jax.tree.map(lambda x: x.copy(), best_params)
+                opt_state = optimizer.init(opt_params)
             continue
         else:
             nan_count = 0
-
+ 
         losses.append(loss_float)
-
+ 
         if loss_float < best_loss:
             best_loss = loss_float
             best_params = jax.tree.map(lambda x: x.copy(), opt_params)
-
+            epochs_since_best = 0
+        else:
+            epochs_since_best += 1
+ 
+        # Rollback if loss has diverged significantly from best
+        if (best_params is not None
+            and best_loss > 0
+            and loss_float > best_loss * divergence_threshold):
+            logger.info(f"    Epoch {epoch:4d}  loss={loss_float:.4f} >> "
+                        f"best={best_loss:.4f}, rolling back")
+            opt_params = jax.tree.map(lambda x: x.copy(), best_params)
+            opt_state = optimizer.init(opt_params)
+            epochs_since_best = 0  # reset patience after rollback
+ 
+        # Patience-based early stopping
+        if epochs_since_best >= patience and epoch > warmup_epochs + patience:
+            logger.info(f"    Early stopping: no improvement for {patience} epochs "
+                        f"(best={best_loss:.4f})")
+            break
+ 
         if epoch % 20 == 0 or epoch == epochs - 1:
-            logger.info(f"    Epoch {epoch:4d}  loss={loss_float:.4f}  best={best_loss:.4f}")
-
+            logger.info(f"    Epoch {epoch:4d}  loss={loss_float:.4f}  "
+                        f"best={best_loss:.4f}")
+ 
     # ------------------------------------------------------------------
     # Step 5: Extract fitted parameters and run final simulation
     # ------------------------------------------------------------------
+    # IMPORTANT: Always use best_params, not the last epoch's params
     if best_params is None:
         logger.error("  No valid parameters found during optimisation")
         return DiagnosticReport(
@@ -579,7 +629,10 @@ def fit_proposal(
             final_loss=float("inf"),
             no_spikes=True,
         )
-
+ 
+    # Use best_params for everything downstream
+    opt_params = best_params
+ 
     fitted = transform.forward(best_params)
     fitted_dict = {}
     for i, name in enumerate(param_names):
@@ -588,16 +641,16 @@ def fit_proposal(
             fitted_dict[name] = float(np.asarray(val).flatten()[0])
         else:
             fitted_dict[name] = float(val)
-
+ 
     logger.info(f"  Fitted parameters: {fitted_dict}")
     logger.info(f"  Best loss: {best_loss:.4f}")
-
+ 
     # Final simulation with best params
     try:
         param_state = None
         for i, name in enumerate(param_names):
             param_state = cell.data_set(name, fitted[i][name], param_state)
-
+ 
         v_final = jx.integrate(cell, param_state=param_state, delta_t=dt)
         v_sim = np.array(v_final[0])
     except Exception as e:

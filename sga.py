@@ -177,64 +177,103 @@ class DiagnosticReport:
             f"- Simulated spikes: {self.n_sim_spikes}, "
             f"Target spikes: {self.n_target_spikes}",
         ]
-
+    
         if p.fitted_params:
-            lines.append("\n## Fitted Parameters:")
+            lines.append("\n## Fitted Parameters (final values):")
             for k, v in p.fitted_params.items():
                 lines.append(f"  {k}: {v:.6f}")
 
+        # Show the bounds that were actually used for ALL parameters
+        lines.append("\n## Bounds Used (from your param_config + defaults):")
+        from general_fit import DEFAULT_PARAM_BOUNDS
+        all_param_names = list(p.fitted_params.keys()) if p.fitted_params else []
+        for name in all_param_names:
+            if name in p.param_config:
+                cfg = p.param_config[name]
+                source = "your param_config"
+            elif name in DEFAULT_PARAM_BOUNDS:
+                cfg = DEFAULT_PARAM_BOUNDS[name]
+                source = "default"
+            else:
+                continue
+            fitted_val = p.fitted_params.get(name, "?")
+            at_bound = ""
+            lower = cfg.get('lower', '?')
+            upper = cfg.get('upper', '?')
+            if (isinstance(fitted_val, (int, float)) and isinstance(lower, (int, float))and isinstance(upper, (int, float))):
+                margin = (upper - lower) * 0.02
+                if abs(fitted_val - lower) < margin:
+                    at_bound = " ⚠️ HIT LOWER BOUND"
+                elif abs(fitted_val - upper) < margin:
+                    at_bound = " ⚠️ HIT UPPER BOUND"
+            lines.append(
+                f"  {name}: fitted={fitted_val:.4f} in [{lower}, {upper}] "
+                f"({source}){at_bound}"
+            )
+    
         lines.append("\n## Diagnostic Issues:")
-
+    
         if self.no_spikes:
             lines.append(
-                "- MODEL DOES NOT SPIKE: The simulation produced 0 spikes "
-                "while the target has spikes. This suggests Na conductance "
-                "is too low, the cell geometry gives insufficient current "
-                "density, or a necessary depolarising current is missing."
+                "- **MODEL DOES NOT SPIKE**: The simulation produced 0 spikes "
+                "while the target has spikes. "
+                "This suggests Na conductance is too low, the cell geometry gives "
+                "insufficient current density, or a necessary depolarising current "
+                "is missing. Check if Na_gNa or eNa are at their upper bounds — "
+                "if so, you MUST widen those bounds in param_config."
             )
-
+    
         if self.wrong_firing_rate:
             ratio = self.n_sim_spikes / max(self.n_target_spikes, 1)
             if ratio < 0.5:
                 lines.append(
-                    f"- FIRING RATE TOO LOW: {self.n_sim_spikes} vs "
-                    f"{self.n_target_spikes} target. Consider increasing "
-                    f"Na conductance, decreasing K conductance, or adding "
-                    f"a depolarising current."
+                    f"- **FIRING RATE TOO LOW**: {self.n_sim_spikes} vs "
+                    f"{self.n_target_spikes} target. Consider: "
+                    f"(1) widening Na_gNa upper bound in param_config, "
+                    f"(2) widening eNa upper bound, "
+                    f"(3) reducing K conductance bounds, "
+                    f"(4) decreasing radius to increase current density."
                 )
             else:
                 lines.append(
-                    f"- FIRING RATE TOO HIGH: {self.n_sim_spikes} vs "
-                    f"{self.n_target_spikes} target. Consider increasing "
-                    f"K conductance or adding adaptation (IM, IAHP)."
+                    f"- **FIRING RATE TOO HIGH**: {self.n_sim_spikes} vs "
+                    f"{self.n_target_spikes} target. Consider: "
+                    f"(1) adding adaptation channels (IM, IAHP), "
+                    f"(2) increasing K conductance upper bound, "
+                    f"(3) widening Kv3 bounds for faster repolarisation."
                 )
-
+    
         if self.broad_spikes:
             lines.append(
-                "- BROAD SPIKES: Spike width is too large. Consider adding "
+                "- **BROAD SPIKES**: Spike width is too large. Consider adding "
                 "Kv3 for faster repolarisation."
             )
-
+    
         if self.excessive_sag:
             lines.append(
-                "- EXCESSIVE SAG: Model hyperpolarises too much. Consider "
-                "reducing IH or adjusting leak reversal potential."
+                "- **EXCESSIVE SAG**: Model hyperpolarises too much. Consider "
+                "reducing IH or adjusting leak reversal potential bounds."
             )
-
+    
         if self.parameters_at_bounds:
-            lines.append(f"- PARAMETERS AT BOUNDS: {self.parameters_at_bounds}")
+            lines.append(f"\n- **PARAMETERS AT BOUNDS**: {self.parameters_at_bounds}")
             lines.append(
-                "These parameters hit their optimisation limits, suggesting the "
-                "model structure may need revision or bounds should be widened."
+                "These parameters are stuck at their optimisation limits. "
+                "The optimizer WANTS to push them further but CANNOT. "
+                "You MUST widen the bounds for these parameters in your "
+                "param_config. Simply changing channels will NOT fix this. "
+                "For each parameter listed above, include it in your param_config "
+                "with a wider range."
             )
-
+    
         if not any([self.no_spikes, self.wrong_firing_rate,
                     self.broad_spikes, self.excessive_sag]):
             lines.append(
                 "- No major structural issues detected. "
-                "Consider fine-tuning or trying different channel combinations."
+                "Consider fine-tuning parameter bounds or trying "
+                "different channel combinations for marginal improvement."
             )
-
+    
         return "\n".join(lines)
 
 
@@ -246,15 +285,15 @@ SYSTEM_PROMPT = """You are a computational neuroscience expert specialising in
 Hodgkin-Huxley-type biophysical models of cortical neurons. You are working with
 the Jaxley differentiable simulation framework to discover optimal HH model
 structures for specific cortical neuron types from the Allen Cell Types Database.
-
+ 
 Your task is to propose and iteratively refine the ion channel composition of
 single-compartment neuron models. You have access to these channels:
-
+ 
 BUILT-IN (Jaxley):
 - Na: Standard Hodgkin-Huxley sodium channel (fast transient)
 - K: Standard HH delayed rectifier potassium channel
 - Leak: Passive leak conductance
-
+ 
 CUSTOM LIBRARY:
 - Kv3: Fast delayed rectifier K+ (Kv3/Shaw). Enables high-frequency firing in PV+ FS cells.
        Key param: Kv3_gKv3, typical range 1e-4 to 0.1 S/cm²
@@ -268,24 +307,86 @@ CUSTOM LIBRARY:
         Key param: ICaL_gCaL, typical range 1e-5 to 1e-2 S/cm²
 - IH: HCN (I_h). Sag and rebound on hyperpolarisation.
       Key param: IH_gH, typical range 1e-6 to 1e-3 S/cm²
-
+ 
 IMPORTANT CONSTRAINTS:
 - Na, K, and Leak are always required and will be auto-inserted.
 - Radius should be 5-15 µm (soma-like). Too large dilutes injected current.
 - Capacitance should be 0.5-2.0 µF/cm². Too large slows dynamics.
 - The optimizer uses sigmoid-bounded gradient descent. Don't set extreme bounds.
-
+ 
+## DEFAULT PARAMETER BOUNDS
+ 
+If you do NOT specify a parameter in param_config, these defaults are used:
+ 
+  Na_gNa:      init=0.5,  lower=0.05,  upper=15.0
+  K_gK:        init=0.2,  lower=0.01,  upper=2.0
+  Leak_gLeak:  init=0.001, lower=1e-5, upper=0.01
+  Leak_eLeak:  init=-65,  lower=-75,   upper=-50
+  Kv3_gKv3:    init=0.01, lower=1e-4,  upper=0.1
+  IM_gM:       init=1e-4, lower=1e-6,  upper=1e-3
+  IAHP_gAHP:   init=1e-4, lower=1e-6,  upper=1e-3
+  IT_gT:       init=1e-4, lower=1e-5,  upper=1e-2
+  ICaL_gCaL:   init=1e-4, lower=1e-5,  upper=1e-2
+  IH_gH:       init=1e-5, lower=1e-6,  upper=1e-3
+  eNa:         init=50,   lower=40,    upper=70
+  eK:          init=-77,  lower=-90,   upper=-70
+  capacitance: init=1.0,  lower=0.5,   upper=2.0
+  radius:      init=10.0, lower=5.0,   upper=15.0
+ 
+## USING param_config TO OVERRIDE BOUNDS
+ 
+**CRITICAL: When the diagnostic feedback reports a parameter "at bounds", you
+MUST widen that parameter's bounds in your next param_config.** A parameter
+stuck at its bound means the optimizer wants to push it further but cannot.
+Simply changing channels will not fix this — you must give the optimizer room
+to move.
+ 
+Your param_config entries override the defaults above. You only need to include
+parameters you want to change — anything omitted uses the default.
+ 
+Each entry must have all three fields: "init", "lower", "upper".
+ 
+## EXAMPLE
+ 
+Suppose the feedback says:
+  "Na_gNa at upper bound (5.0)" and "eNa at upper bound (60.0)"
+ 
+This means the model needs more sodium current. A good response would widen
+BOTH the conductance AND reversal potential bounds:
+ 
+```json
+{
+    "channels": ["Na", "K", "Leak", "Kv3"],
+    "param_config": {
+        "Na_gNa":  {"init": 3.0, "lower": 0.1, "upper": 15.0},
+        "K_gK":    {"init": 0.3, "lower": 0.01, "upper": 3.0},
+        "Kv3_gKv3": {"init": 0.02, "lower": 1e-4, "upper": 0.5},
+        "eNa":     {"init": 55.0, "lower": 45.0, "upper": 75.0},
+        "eK":      {"init": -80.0, "lower": -100.0, "upper": -65.0}
+    },
+    "radius": 10.0,
+    "capacitance": 1.0,
+    "rationale": "Na_gNa was stuck at its 5.0 upper bound — widened to 15.0 to allow the optimizer to find the needed conductance. Also widened eNa upper to 75 mV since it was constrained at 60 mV. Kept Kv3 for fast repolarisation but widened its upper bound for flexibility."
+}
+```
+ 
+## RESPONSE FORMAT
+ 
 Always respond with a JSON object containing:
 {
     "channels": ["Na", "K", "Leak", ...additional channels...],
     "param_config": {
-        "Na_gNa": {"init": 0.5, "lower": 0.05, "upper": 5.0},
+        "param_name": {"init": float, "lower": float, "upper": float},
         ...
     },
-    "radius": 10.0,
-    "capacitance": 1.0,
-    "rationale": "Explanation of structural choices..."
+    "radius": float,
+    "capacitance": float,
+    "rationale": "Your reasoning, especially explaining any bound changes..."
 }
+ 
+Include param_config entries for ALL parameters you have an opinion about,
+especially any that were flagged as at-bounds in the feedback. Omitting a
+parameter means accepting the default bounds listed above.
 """
 
 
@@ -308,26 +409,31 @@ and parameter configurations. Consider:
 Respond with a JSON object as specified in your instructions."""
 
 
-def make_revision_prompt(diagnostic: DiagnosticReport,
-                         heap_summary: str) -> str:
+def make_revision_prompt(diagnostic, heap_summary: str) -> str:
     """Build the Stage 2 outer-loop prompt: revise model based on feedback."""
     feedback = diagnostic.generate_feedback()
-
+ 
     return f"""## Task: Revise the model structure based on fitting results
-
+ 
 {feedback}
-
+ 
 ## Current Best Proposals:
 {heap_summary}
-
+ 
 Based on the diagnostic feedback above, propose a REVISED model structure.
 You may:
-- Add channels that address identified issues (e.g. Kv3 for broad spikes)
-- Remove channels that are unnecessary
-- Adjust parameter ranges and initial values
+- Add or remove channels to address identified issues
+- **Widen parameter bounds via param_config for any parameter flagged as "at bounds"** — this is the HIGHEST PRIORITY action when parameters are constrained
+- Adjust initial values to start closer to the expected optimum
 - Modify cell geometry (radius, capacitance)
-
-Focus on the most critical issue first. Explain your reasoning.
+ 
+### Decision Priority:
+1. FIRST: Fix any "parameters at bounds" by widening those bounds in param_config
+2. THEN: Address structural issues (missing channels, wrong channel types)
+3. LAST: Fine-tune initial values and geometry
+ 
+Focus on the most critical issue first. Explain your reasoning, especially
+for any bound changes.
 Respond with a JSON object as specified in your instructions."""
 
 
