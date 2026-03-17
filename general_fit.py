@@ -31,7 +31,7 @@ Requires:
 
 # ---- JAX config must come before any JAX imports ----
 from jax import config
-config.update("jax_enable_x64", True)
+config.update("jax_enable_x64", False)
 
 import json
 import logging

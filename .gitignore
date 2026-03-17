@@ -11,6 +11,7 @@ env/
 venv/
 .conda/
 .env/
+.env
 
 # Local Data (Don't push heavy NWB files or downloaded datasets!)
 cell_types_data/

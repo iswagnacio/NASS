@@ -21,6 +21,8 @@ Usage:
 """
 
 import os
+os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ['JAX_TRACEBACK_FILTERING_MODE'] = 'off'
 import json
 import logging
 import argparse

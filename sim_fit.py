@@ -30,7 +30,6 @@ Output:
 # ---- JAX config must come before any JAX imports ----
 from jax import config
 config.update("jax_enable_x64", False)
-config.update("jax_platform_name", "METAL")
 
 import os
 import json
