@@ -81,24 +81,28 @@ ALL_CHANNELS = {**BUILTIN_CHANNELS, **CUSTOM_CHANNELS}
 
 # Default parameter bounds per channel when the proposal doesn't specify them.
 # These are biophysically reasonable ranges from the proposal + Pospischil (2008).
+# Bounds are deliberately tighter than the full biophysical range to prevent
+# the optimizer from "cheating" (e.g. inflating radius to dilute current,
+# shifting reversal potentials to extremes instead of learning to spike).
 DEFAULT_PARAM_BOUNDS = {
-    # Builtin
+    # Conductances — wide enough for FS cells
     "Na_gNa":       {"init": 0.5,   "lower": 0.05,  "upper": 5.0},
     "K_gK":         {"init": 0.2,   "lower": 0.01,  "upper": 2.0},
-    "Leak_gLeak":   {"init": 0.001, "lower": 1e-5,  "upper": 0.05},
-    "Leak_eLeak":   {"init": -60.0, "lower": -80.0, "upper": -40.0},
-    # Custom
+    "Leak_gLeak":   {"init": 0.001, "lower": 1e-5,  "upper": 0.01},
+    "Leak_eLeak":   {"init": -65.0, "lower": -75.0, "upper": -50.0},
+    # Custom channels
     "Kv3_gKv3":     {"init": 0.01,  "lower": 1e-4,  "upper": 0.1},
     "IM_gM":        {"init": 1e-4,  "lower": 1e-6,  "upper": 1e-3},
     "IAHP_gAHP":    {"init": 1e-4,  "lower": 1e-6,  "upper": 1e-3},
     "IT_gT":        {"init": 1e-4,  "lower": 1e-5,  "upper": 1e-2},
     "ICaL_gCaL":    {"init": 1e-4,  "lower": 1e-5,  "upper": 1e-2},
     "IH_gH":        {"init": 1e-5,  "lower": 1e-6,  "upper": 1e-3},
-    # Global
-    "eNa":          {"init": 50.0,  "lower": 30.0,  "upper": 70.0},
-    "eK":           {"init": -77.0, "lower": -100.0, "upper": -60.0},
-    "capacitance":  {"init": 1.0,   "lower": 0.5,   "upper": 3.0},
-    "radius":       {"init": 10.0,  "lower": 3.0,   "upper": 30.0},
+    # Reversal potentials — tighter to prevent optimizer cheating
+    "eNa":          {"init": 50.0,  "lower": 40.0,  "upper": 60.0},
+    "eK":           {"init": -77.0, "lower": -90.0, "upper": -70.0},
+    # Geometry — tighter radius prevents current dilution
+    "capacitance":  {"init": 1.0,   "lower": 0.5,   "upper": 2.0},
+    "radius":       {"init": 10.0,  "lower": 5.0,   "upper": 15.0},
 }
 
 # Map channel names to their conductance parameter names.
@@ -225,15 +229,72 @@ def build_generalized_loss_fn(cell, target_v, dt, transform, param_names):
         for i, name in enumerate(param_names):
             param_state = cell.data_set(name, params[i][name], param_state)
 
-        v = jx.integrate(cell, param_state=param_state, delta_t=dt)
-        v_sim = v[0]
+        try:
+            v = jx.integrate(cell, param_state=param_state, delta_t=dt)
+            v_sim = v[0]
 
-        n = min(len(v_sim), len(target_v))
-        mse = jnp.mean((v_sim[:n] - target_v[:n]) ** 2)
+            n = min(len(v_sim), len(target_v))
+            mse = jnp.mean((v_sim[:n] - target_v[:n]) ** 2)
+        except Exception:
+            mse = jnp.inf
 
         return mse
 
     return loss_fn
+
+
+# ===========================================================================
+# Stimulus Windowing
+# ===========================================================================
+
+def window_to_main_stimulus(stimulus, target_v_jnp, dt, max_duration_ms=1200.0):
+    """
+    Window stimulus and target to the main current step, ignoring short
+    test pulses. Finds the longest contiguous block of supra-threshold
+    stimulus and pads around it.
+
+    Returns (stimulus_windowed, target_windowed, t_max_ms).
+    """
+    stim_np = np.array(stimulus)
+    stim_threshold = np.max(np.abs(stim_np)) * 0.1
+    above = np.abs(stim_np) > stim_threshold
+    active_indices = np.where(above)[0]
+
+    if len(active_indices) > 0:
+        # Split into contiguous blocks and find the longest one
+        breaks = np.where(np.diff(active_indices) > int(5.0 / dt))[0]
+        if len(breaks) > 0:
+            blocks = np.split(active_indices, breaks + 1)
+            main_block = max(blocks, key=len)
+        else:
+            main_block = active_indices
+
+        pre_pad = int(50.0 / dt)
+        post_pad = int(100.0 / dt)
+        start_idx = max(0, main_block[0] - pre_pad)
+        end_idx = min(len(stim_np), main_block[-1] + post_pad)
+
+        max_samples = int(max_duration_ms / dt) + 1
+        if (end_idx - start_idx) > max_samples:
+            end_idx = start_idx + max_samples
+
+        stimulus = stimulus[start_idx:end_idx]
+        target_v_jnp = target_v_jnp[start_idx:end_idx]
+        t_max = len(stimulus) * dt
+
+        logger.info(
+            f"  Windowed to main stimulus: [{start_idx*dt:.0f}–{end_idx*dt:.0f}] ms, "
+            f"{len(stimulus)} steps, {t_max:.0f} ms")
+    elif len(stimulus) * dt > max_duration_ms:
+        n_keep = int(max_duration_ms / dt) + 1
+        stimulus = stimulus[:n_keep]
+        target_v_jnp = target_v_jnp[:n_keep]
+        t_max = max_duration_ms
+        logger.info(f"  No clear stimulus found; truncated to {max_duration_ms:.0f} ms")
+    else:
+        t_max = len(stimulus) * dt
+
+    return stimulus, target_v_jnp, t_max
 
 
 # ===========================================================================
@@ -278,21 +339,13 @@ def compute_diagnostics(
         rate_ratio = n_sim_spikes / n_tgt_spikes
         wrong_firing_rate = rate_ratio < 0.5 or rate_ratio > 2.0
 
-    # Spike width check: compare mean peak-to-trough widths
+    # Spike width check
     broad_spikes = False
     if n_sim_spikes >= 3 and n_tgt_spikes >= 3:
-        # Rough half-width estimate from spike crossings
         sim_crossing_idxs = np.where(sim_crossings)[0]
         tgt_crossing_idxs = np.where(tgt_crossings)[0]
 
-        # Mean ISI as proxy for spike timing characteristics
         if len(sim_crossing_idxs) >= 2 and len(tgt_crossing_idxs) >= 2:
-            sim_mean_isi = np.mean(np.diff(sim_crossing_idxs)) * dt
-            tgt_mean_isi = np.mean(np.diff(tgt_crossing_idxs)) * dt
-            # If sim ISI is much larger, spikes may be broader
-            # More robust: check spike peak widths
-            # For now, flag if upstroke/downstroke timing looks wrong
-            # We'll use a simple heuristic: if peaks are wider than expected
             for idx in sim_crossing_idxs[:5]:
                 if idx + int(2.0 / dt) < len(v_sim):
                     post_spike = v_sim[idx:idx + int(2.0 / dt)]
@@ -300,14 +353,13 @@ def compute_diagnostics(
                         broad_spikes = True
                         break
 
-    # Sag check: look at hyperpolarizing portions
+    # Sag check
     excessive_sag = False
     subthreshold_mask = target_v < -70.0
     if subthreshold_mask.sum() > 10:
         tgt_hyp = target_v[subthreshold_mask]
         sim_hyp = v_sim[subthreshold_mask] if subthreshold_mask.sum() <= len(v_sim) else np.array([])
         if len(sim_hyp) > 0:
-            # If simulation goes much more negative than target
             if np.min(sim_hyp) < np.min(tgt_hyp) - 10.0:
                 excessive_sag = True
 
@@ -348,7 +400,7 @@ def fit_proposal(
     specimen_id: int,
     data_dir: str,
     dt: float = 0.025,
-    epochs: int = 80,
+    epochs: int = 300,
     lr: float = 0.02,
     max_duration_ms: float = 1200.0,
 ) -> DiagnosticReport:
@@ -422,30 +474,13 @@ def fit_proposal(
         )
 
     # ------------------------------------------------------------------
-    # Step 2b: Window to stimulus region (same logic as jaxley_fit.py)
+    # Step 2b: Window to main stimulus region
     # ------------------------------------------------------------------
-    stim_np = np.array(stimulus)
-    stim_threshold = np.max(np.abs(stim_np)) * 0.1
-    active_indices = np.where(np.abs(stim_np) > stim_threshold)[0]
+    stimulus, target_v_jnp, t_max = window_to_main_stimulus(
+        stimulus, target_v_jnp, dt, max_duration_ms)
 
-    if len(active_indices) > 0:
-        pre_pad = int(50.0 / dt)
-        post_pad = int(100.0 / dt)
-        start_idx = max(0, active_indices[0] - pre_pad)
-        end_idx = min(len(stim_np), active_indices[-1] + post_pad)
-        max_samples = int(max_duration_ms / dt) + 1
-        if (end_idx - start_idx) > max_samples:
-            end_idx = start_idx + max_samples
-        stimulus = stimulus[start_idx:end_idx]
-        target_v_jnp = target_v_jnp[start_idx:end_idx]
-        t_max = len(stimulus) * dt
-    elif t_max > max_duration_ms:
-        n_keep = int(max_duration_ms / dt) + 1
-        stimulus = stimulus[:n_keep]
-        target_v_jnp = target_v_jnp[:n_keep]
-        t_max = max_duration_ms
-
-    logger.info(f"  Stimulus window: {len(stimulus)} steps, {t_max:.0f} ms")
+    logger.info(f"  Stimulus window: {len(stimulus)} steps, {t_max:.0f} ms, "
+                f"stim range [{np.min(stimulus):.3f}, {np.max(stimulus):.3f}] nA")
 
     # ------------------------------------------------------------------
     # Step 3: Set up simulation and trainable parameters
@@ -483,19 +518,17 @@ def fit_proposal(
     # ------------------------------------------------------------------
     loss_fn = build_generalized_loss_fn(cell, target_v_jnp, dt, transform, param_names)
 
-    try:
-        grad_fn = jit(value_and_grad(loss_fn))
-    except Exception as e:
-        logger.error(f"  JIT compilation failed: {e}")
-        return DiagnosticReport(
-            proposal=proposal,
-            specimen_id=specimen_id,
-            final_loss=float("inf"),
-            no_spikes=True,
-        )
-
     optimizer = optax.adam(lr)
     opt_state = optimizer.init(opt_params)
+
+    # JIT-compiled training step with gradient clipping
+    @jit
+    def step(params, opt_state):
+        loss_val, grads = value_and_grad(loss_fn)(params)
+        grads = jax.tree.map(lambda g: jnp.clip(g, -10.0, 10.0), grads)
+        updates, new_opt_state = optimizer.update(grads, opt_state)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, loss_val
 
     losses = []
     best_loss = float("inf")
@@ -507,7 +540,7 @@ def fit_proposal(
 
     for epoch in range(epochs):
         try:
-            loss_val, grads = grad_fn(opt_params)
+            opt_params, opt_state, loss_val = step(opt_params, opt_state)
             loss_float = float(loss_val)
         except Exception as e:
             logger.warning(f"  Epoch {epoch}: simulation error — {e}")
@@ -526,11 +559,6 @@ def fit_proposal(
         else:
             nan_count = 0
 
-        # Gradient clipping
-        grads = jax.tree.map(lambda g: jnp.clip(g, -10.0, 10.0), grads)
-
-        updates, opt_state = optimizer.update(grads, opt_state)
-        opt_params = optax.apply_updates(opt_params, updates)
         losses.append(loss_float)
 
         if loss_float < best_loss:
@@ -556,7 +584,10 @@ def fit_proposal(
     fitted_dict = {}
     for i, name in enumerate(param_names):
         val = fitted[i][name]
-        fitted_dict[name] = float(val[0]) if hasattr(val, '__len__') else float(val)
+        if isinstance(val, (list, np.ndarray, jnp.ndarray)):
+            fitted_dict[name] = float(np.asarray(val).flatten()[0])
+        else:
+            fitted_dict[name] = float(val)
 
     logger.info(f"  Fitted parameters: {fitted_dict}")
     logger.info(f"  Best loss: {best_loss:.4f}")
@@ -625,7 +656,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", type=str, default="cell_types_data")
     parser.add_argument("--specimen-id", type=int, default=None,
                         help="Specimen ID (default: first valid cell)")
-    parser.add_argument("--epochs", type=int, default=60)
+    parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--channels", nargs="+",
                         default=["Na", "K", "Leak", "Kv3"],
                         help="Channels to test (default: Na K Leak Kv3)")

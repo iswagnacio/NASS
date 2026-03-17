@@ -49,6 +49,7 @@ import matplotlib.pyplot as plt
 
 import jaxley as jx
 from jaxley.channels import Na, K, Leak
+from jaxley.optimize.transforms import ParamTransform, SigmoidTransform
 
 from allensdk.core.cell_types_cache import CellTypesCache
 
@@ -223,9 +224,21 @@ def prepare_stimulus(sweep: dict, dt: float = 0.025) -> np.ndarray:
     Allen recordings are typically at 200 kHz; Jaxley uses dt in ms.
 
     Allen stimulus is in Amps; Jaxley expects nA.
+    Includes validation to detect empty or invalid data.
     """
     sr = sweep["sampling_rate"]
     stimulus_amps = sweep["stimulus"]
+
+    # Ensure 1D
+    if stimulus_amps.ndim > 1:
+        stimulus_amps = stimulus_amps.flatten()
+
+    # Validate data
+    if len(stimulus_amps) == 0:
+        raise ValueError("Stimulus array is empty!")
+
+    if np.all(np.isnan(stimulus_amps)):
+        raise ValueError("All stimulus values are NaN!")
 
     # Convert A -> nA
     stimulus_nA = stimulus_amps * 1e9
@@ -235,13 +248,29 @@ def prepare_stimulus(sweep: dict, dt: float = 0.025) -> np.ndarray:
     t_max_s = t_allen[-1]
     t_max_ms = t_max_s * 1000.0
 
+    # Validate t_max
+    if not np.isfinite(t_max_ms) or t_max_ms <= 0:
+        raise ValueError(
+            f"Invalid t_max_ms: {t_max_ms}. "
+            f"Check sampling rate ({sr}) and stimulus length ({len(stimulus_amps)})"
+        )
+
     # Jaxley time in ms
-    n_steps = int(t_max_ms / dt) + 1
+    n_steps = int(np.round(t_max_ms / dt)) + 1
+
+    if n_steps <= 0:
+        raise ValueError(f"Invalid n_steps: {n_steps}. t_max_ms={t_max_ms}, dt={dt}")
+
     t_jaxley_ms = np.arange(n_steps) * dt
     t_jaxley_s = t_jaxley_ms / 1000.0
 
     # Resample stimulus to Jaxley timestep via interpolation
     stimulus_resampled = np.interp(t_jaxley_s, t_allen, stimulus_nA)
+
+    logger.info(
+        f"  Stimulus resampled: {len(stimulus_amps)} -> {len(stimulus_resampled)} points, "
+        f"t_max={t_max_ms:.1f} ms"
+    )
 
     return stimulus_resampled, t_max_ms
 
@@ -250,9 +279,18 @@ def prepare_target(sweep: dict, dt: float = 0.025) -> np.ndarray:
     """
     Resample the Allen voltage response to Jaxley's simulation timestep.
     Allen response is in Volts; Jaxley uses mV.
+    Includes validation to detect empty or invalid data.
     """
     sr = sweep["sampling_rate"]
     response_V = sweep["response"]
+
+    # Ensure 1D
+    if response_V.ndim > 1:
+        response_V = response_V.flatten()
+
+    # Validate data
+    if len(response_V) == 0:
+        raise ValueError("Response array is empty!")
 
     # Convert V -> mV
     response_mV = response_V * 1e3
@@ -261,7 +299,15 @@ def prepare_target(sweep: dict, dt: float = 0.025) -> np.ndarray:
     t_max_s = t_allen[-1]
     t_max_ms = t_max_s * 1000.0
 
-    n_steps = int(t_max_ms / dt) + 1
+    # Validate t_max
+    if not np.isfinite(t_max_ms) or t_max_ms <= 0:
+        raise ValueError(f"Invalid t_max_ms for response: {t_max_ms}")
+
+    n_steps = int(np.round(t_max_ms / dt)) + 1
+
+    if n_steps <= 0:
+        raise ValueError(f"Invalid n_steps for response: {n_steps}")
+
     t_jaxley_ms = np.arange(n_steps) * dt
     t_jaxley_s = t_jaxley_ms / 1000.0
 
@@ -297,6 +343,21 @@ def setup_simulation(cell: jx.Compartment, stimulus: np.ndarray,
     return cell
 
 
+def get_sigmoid_transforms() -> ParamTransform:
+    """Define sigmoid transforms with biophysical bounds for Na+K+Leak model."""
+    transforms = [
+        {"Na_gNa": SigmoidTransform(lower=0.05, upper=5.0)},    # FS cells can be very high
+        {"K_gK": SigmoidTransform(lower=0.01, upper=2.0)},      # also high for FS
+        {"Leak_gLeak": SigmoidTransform(lower=1e-5, upper=0.05)},
+        {"Leak_eLeak": SigmoidTransform(lower=-80.0, upper=-40.0)},
+        {"capacitance": SigmoidTransform(lower=0.5, upper=3.0)},
+        {"eNa": SigmoidTransform(lower=30.0, upper=70.0)},
+        {"eK": SigmoidTransform(lower=-100.0, upper=-60.0)},
+        {"radius": SigmoidTransform(lower=3.0, upper=30.0)},    # controls effective area
+    ]
+    return ParamTransform(transforms)
+
+
 def build_loss_fn(cell, target_v, dt, transform):
     """
     Build a differentiable loss function that:
@@ -305,37 +366,36 @@ def build_loss_fn(cell, target_v, dt, transform):
     3. Runs Jaxley simulation
     4. Computes MSE between simulated and recorded voltage
 
-    The loss combines:
-    - Waveform MSE (primary)
-    - Penalty for non-physiological resting potential
+    Uses loop-based parameter setting for maintainability.
+    Includes try/except to handle simulation failures gracefully.
     """
 
     def loss_fn(opt_params):
         # Transform from unconstrained -> constrained parameter space
-        params = transform.forward(opt_params)
+        fitted = transform.forward(opt_params)
 
-        # Set parameters on the cell
+        # Set parameters on the cell via loop
         param_state = None
-        param_state = cell.data_set("Na_gNa", params[0]["Na_gNa"], param_state)
-        param_state = cell.data_set("K_gK", params[1]["K_gK"], param_state)
-        param_state = cell.data_set("Leak_gLeak", params[2]["Leak_gLeak"], param_state)
-        param_state = cell.data_set("Leak_eLeak", params[3]["Leak_eLeak"], param_state)
-        param_state = cell.data_set("capacitance", params[4]["capacitance"], param_state)
-        param_state = cell.data_set("eNa", params[5]["eNa"], param_state)
-        param_state = cell.data_set("eK", params[6]["eK"], param_state)
-        param_state = cell.data_set("radius", params[7]["radius"], param_state)
+        for i, param_dict in enumerate(fitted):
+            for param_name, param_value in param_dict.items():
+                param_state = cell.data_set(param_name, param_value, param_state)
 
-        # Run simulation
-        v = jx.integrate(cell, param_state=param_state, delta_t=dt)
-        v_sim = v[0]  # shape: (n_timesteps,)
+        try:
+            # Run simulation
+            v = jx.integrate(cell, param_state=param_state, delta_t=dt)
+            v_sim = v[0]  # shape: (n_timesteps,)
 
-        # Trim to match target length
-        n = min(len(v_sim), len(target_v))
-        v_sim_trimmed = v_sim[:n]
-        v_target_trimmed = target_v[:n]
+            # Trim to match target length
+            n = min(len(v_sim), len(target_v))
+            v_sim_trimmed = v_sim[:n]
+            v_target_trimmed = target_v[:n]
 
-        # Waveform MSE loss
-        mse = jnp.mean((v_sim_trimmed - v_target_trimmed) ** 2)
+            # Waveform MSE loss
+            mse = jnp.mean((v_sim_trimmed - v_target_trimmed) ** 2)
+
+        except Exception as e:
+            logger.debug(f"Simulation failed: {e}")
+            mse = jnp.inf
 
         return mse
 
@@ -429,27 +489,23 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
     opt_params = cell.get_parameters()
 
     # Sigmoid transforms to keep parameters in biophysical bounds
-    from jaxley.optimize.transforms import ParamTransform, SigmoidTransform
+    transform = get_sigmoid_transforms()
 
-    transforms = [
-        {"Na_gNa": SigmoidTransform(lower=0.05, upper=5.0)},    # FS cells can be very high
-        {"K_gK": SigmoidTransform(lower=0.01, upper=2.0)},      # also high for FS
-        {"Leak_gLeak": SigmoidTransform(lower=1e-5, upper=0.05)},
-        {"Leak_eLeak": SigmoidTransform(lower=-80.0, upper=-40.0)},
-        {"capacitance": SigmoidTransform(lower=0.5, upper=3.0)},
-        {"eNa": SigmoidTransform(lower=30.0, upper=70.0)},
-        {"eK": SigmoidTransform(lower=-100.0, upper=-60.0)},
-        {"radius": SigmoidTransform(lower=3.0, upper=30.0)},    # controls effective area
-    ]
-    transform = ParamTransform(transforms)
-
-    # ---- Build loss and gradient functions ----
+    # ---- Build loss and optimiser ----
     loss_fn = build_loss_fn(cell, target_v_jnp, dt, transform)
-    grad_fn = jit(value_and_grad(loss_fn))
 
-    # ---- Optimizer ----
     optimizer = optax.adam(lr)
     opt_state = optimizer.init(opt_params)
+
+    # ---- JIT-compiled training step ----
+    @jit
+    def step(params, opt_state):
+        loss_val, grads = value_and_grad(loss_fn)(params)
+        # Gradient clipping to prevent instability
+        grads = jax.tree.map(lambda g: jnp.clip(g, -10.0, 10.0), grads)
+        updates, new_opt_state = optimizer.update(grads, opt_state)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, loss_val
 
     # ---- Training loop ----
     losses = []
@@ -460,7 +516,7 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
 
     for epoch in range(epochs):
         try:
-            loss_val, grads = grad_fn(opt_params)
+            opt_params, opt_state, loss_val = step(opt_params, opt_state)
             loss_val_float = float(loss_val)
         except Exception as e:
             logger.error(f"  Epoch {epoch}: simulation failed — {e}")
@@ -471,13 +527,6 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
             logger.warning(f"  Epoch {epoch}: NaN loss, stopping")
             break
 
-        # Gradient clipping to prevent instability
-        grads = jax.tree.map(
-            lambda g: jnp.clip(g, -10.0, 10.0), grads
-        )
-
-        updates, opt_state = optimizer.update(grads, opt_state)
-        opt_params = optax.apply_updates(opt_params, updates)
         losses.append(loss_val_float)
 
         if loss_val_float < best_loss:
@@ -493,30 +542,24 @@ def fit_cell(ctc: CellTypesCache, specimen_id: int, sweep_index: dict,
         return {"specimen_id": specimen_id, "success": False}
 
     fitted = transform.forward(best_params)
-    fitted_dict = {
-        "Na_gNa": float(fitted[0]["Na_gNa"][0]),
-        "K_gK": float(fitted[1]["K_gK"][0]),
-        "Leak_gLeak": float(fitted[2]["Leak_gLeak"][0]),
-        "Leak_eLeak": float(fitted[3]["Leak_eLeak"][0]),
-        "capacitance": float(fitted[4]["capacitance"][0]),
-        "eNa": float(fitted[5]["eNa"][0]),
-        "eK": float(fitted[6]["eK"][0]),
-        "radius": float(fitted[7]["radius"][0]),
-    }
+    param_names = ["Na_gNa", "K_gK", "Leak_gLeak", "Leak_eLeak",
+                   "capacitance", "eNa", "eK", "radius"]
+
+    fitted_dict = {}
+    for i, param_name in enumerate(param_names):
+        val = fitted[i][param_name]
+        if isinstance(val, (list, np.ndarray, jnp.ndarray)):
+            fitted_dict[param_name] = float(np.asarray(val).flatten()[0])
+        else:
+            fitted_dict[param_name] = float(val)
 
     logger.info(f"  Fitted parameters: {fitted_dict}")
     logger.info(f"  Best loss: {best_loss:.4f}")
 
     # ---- Run final simulation with best params ----
     param_state = None
-    param_state = cell.data_set("Na_gNa", fitted[0]["Na_gNa"], param_state)
-    param_state = cell.data_set("K_gK", fitted[1]["K_gK"], param_state)
-    param_state = cell.data_set("Leak_gLeak", fitted[2]["Leak_gLeak"], param_state)
-    param_state = cell.data_set("Leak_eLeak", fitted[3]["Leak_eLeak"], param_state)
-    param_state = cell.data_set("capacitance", fitted[4]["capacitance"], param_state)
-    param_state = cell.data_set("eNa", fitted[5]["eNa"], param_state)
-    param_state = cell.data_set("eK", fitted[6]["eK"], param_state)
-    param_state = cell.data_set("radius", fitted[7]["radius"], param_state)
+    for i, param_name in enumerate(param_names):
+        param_state = cell.data_set(param_name, fitted[i][param_name], param_state)
 
     v_final = jx.integrate(cell, param_state=param_state, delta_t=dt)
     v_sim = np.array(v_final[0])
@@ -738,7 +781,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--lr", type=float, default=0.02,
-        help="Adam learning rate (default: 0.005)"
+        help="Adam learning rate (default: 0.02)"
     )
     parser.add_argument(
         "--dt", type=float, default=0.025,

@@ -1,6 +1,6 @@
 """
-SGA-Style Outer Loop Scaffolding (Weeks 7–8, Part 2)
-=====================================================
+SGA-Style Outer Loop (Weeks 7–8 / 11–12)
+=========================================
 
 Adapts the Scientific Generative Agent (Ma et al., NeurIPS 2024) bilevel
 optimization framework from material science to neuroscience.
@@ -12,18 +12,13 @@ Core components:
     4. OuterLoop — orchestrates the propose → fit → diagnose → revise cycle
     5. Prompt templates — neuroscience-specific prompts for the LLM
 
-The key insight from the proposal: "SGA gives us ~70% of the infrastructure.
-We replace its material-science simulation backend with BrainPy's neuron ODE
-solver, replace its constitutive-law templates with HH equation templates,
-and point it at Allen patch-clamp data instead of material deformation data."
-
 Usage:
-    from sga_scaffold import OuterLoop, ModelProposal
+    from sga import OuterLoop
 
     loop = OuterLoop(
         specimen_id=509683388,
-        data_dir="./data",
-        api_key="your-api-key",
+        data_dir="./cell_types_data",
+        api_key="sk-ant-...",
         model="claude-sonnet-4-20250514",
     )
     best = loop.run(max_iterations=5)
@@ -35,10 +30,17 @@ Requires:
 import json
 import time
 import logging
+import os
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 import heapq
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 logger = logging.getLogger(__name__)
 
@@ -51,18 +53,18 @@ logger = logging.getLogger(__name__)
 class ModelProposal:
     """
     A proposed HH-type model structure. This is what the LLM generates
-    and what gets passed to the BrainPy inner loop.
+    and what gets passed to the Jaxley inner loop.
     """
     # Identity
     proposal_id: int = 0
     iteration: int = 0
-    parent_id: Optional[int] = None  # which proposal this was derived from
+    parent_id: Optional[int] = None
 
     # Model structure — list of channel names to insert
     channels: list = field(default_factory=lambda: ["Na", "K", "Leak"])
 
     # Parameter initial values and bounds
-    # Format: {"channel_param_name": {"init": float, "lower": float, "upper": float}}
+    # Format: {"param_name": {"init": float, "lower": float, "upper": float}}
     param_config: dict = field(default_factory=dict)
 
     # Cell geometry
@@ -82,59 +84,6 @@ class ModelProposal:
     def __lt__(self, other):
         return self.loss < other.loss
 
-    def to_brainpy_code(self) -> str:
-        """Generate BrainPy-compatible Python code for this model."""
-        lines = [
-            "import brainpy as bp",
-            "import brainpy.math as bm",
-            "from channels import Kv3, IM, IAHP, IT, ICaL, IH",
-            "",
-            "class ProposedNeuron(bp.dyn.CondNeuGroupLTC):",
-            "    def __init__(self, size, **kwargs):",
-            "        super().__init__(",
-            f"            size, C={self.capacitance},",
-            "            V_th=20.0,",
-            "            V_initializer=bp.init.Constant(-65.0),",
-            "        )",
-        ]
-
-        # Map channel names to BrainPy channel classes
-        # BrainPy built-in HH channels use bp.dyn.* classes
-        channel_map = {
-            "Na":   ("INa", "bp.dyn.INa_HH1952"),
-            "K":    ("IK",  "bp.dyn.IK_HH1952"),
-            "Leak": ("IL",  "bp.dyn.IL"),
-        }
-        # Custom channels are imported from the channels module
-        custom_channels = {"Kv3", "IM", "IAHP", "IT", "ICaL", "IH"}
-
-        for ch in self.channels:
-            if ch in channel_map:
-                attr_name, cls_name = channel_map[ch]
-                # Look up init params from param_config if available
-                g_key = f"{ch}_g{ch}"
-                g_init = self.param_config.get(g_key, {}).get("init")
-                if g_init is not None:
-                    lines.append(f"        self.{attr_name} = {cls_name}(size, g_max={g_init})")
-                else:
-                    lines.append(f"        self.{attr_name} = {cls_name}(size)")
-            elif ch in custom_channels:
-                g_key = f"{ch}_g{ch}"
-                g_init = self.param_config.get(g_key, {}).get("init")
-                if g_init is not None:
-                    lines.append(f"        self.I{ch} = {ch}(size, g_max={g_init})")
-                else:
-                    lines.append(f"        self.I{ch} = {ch}(size)")
-            else:
-                lines.append(f"        # Unknown channel: {ch}")
-
-        lines.extend([
-            "",
-            "model = ProposedNeuron(size=1)",
-        ])
-
-        return "\n".join(lines)
-
     def summary(self) -> str:
         return (
             f"Proposal #{self.proposal_id} (iter {self.iteration}): "
@@ -145,15 +94,11 @@ class ModelProposal:
 
 
 # ===========================================================================
-# 2. Top-K Heap — maintains best proposals (SGA core data structure)
+# 2. Top-K Heap
 # ===========================================================================
 
 class TopKHeap:
-    """
-    Min-heap of the K best model proposals, ranked by loss.
-    This is the central data structure from SGA that persists across
-    outer-loop iterations.
-    """
+    """Min-heap of the K best model proposals, ranked by loss."""
 
     def __init__(self, k: int = 5):
         self.k = k
@@ -161,27 +106,22 @@ class TopKHeap:
         self._counter = 0
 
     def push(self, proposal: ModelProposal):
-        """Add a proposal. If heap is full, only keeps if better than worst."""
         if len(self._heap) < self.k:
-            # Use negative loss for max-heap behavior (we want to evict worst)
             heapq.heappush(self._heap, proposal)
         elif proposal.loss < self.worst_loss():
             heapq.heapreplace(self._heap, proposal)
 
     def best(self) -> Optional[ModelProposal]:
-        """Return the best (lowest loss) proposal."""
         if not self._heap:
             return None
         return min(self._heap, key=lambda p: p.loss)
 
     def worst_loss(self) -> float:
-        """Return the worst (highest) loss in the heap."""
         if not self._heap:
             return float("inf")
         return max(p.loss for p in self._heap)
 
     def top_k(self) -> list[ModelProposal]:
-        """Return all proposals sorted by loss (best first)."""
         return sorted(self._heap, key=lambda p: p.loss)
 
     def next_id(self) -> int:
@@ -199,15 +139,14 @@ class TopKHeap:
 
 
 # ===========================================================================
-# 3. Diagnostic Report — translates inner-loop results for the LLM
+# 3. Diagnostic Report
 # ===========================================================================
 
 @dataclass
 class DiagnosticReport:
     """
     Structured feedback from the inner loop that the LLM uses to
-    revise the model structure. This is the "diagnostic-to-feedback
-    translator" from the proposal.
+    revise the model structure.
     """
     proposal: ModelProposal
     specimen_id: int
@@ -219,7 +158,7 @@ class DiagnosticReport:
     pearson_r: float = 0.0
     model_spikes: bool = False
 
-    # Specific diagnostic flags (from proposal Section 3.3)
+    # Diagnostic flags
     no_spikes: bool = False
     wrong_firing_rate: bool = False
     wrong_adaptation: bool = False
@@ -228,103 +167,122 @@ class DiagnosticReport:
     parameters_at_bounds: list = field(default_factory=list)
 
     def generate_feedback(self) -> str:
-        """
-        Generate natural-language feedback for the LLM, following the
-        proposal's diagnostic categories.
-        """
+        """Generate natural-language feedback for the LLM."""
+        p = self.proposal
         lines = [
-            f"## Inner Loop Results for Proposal #{self.proposal.proposal_id}",
-            f"- Channels: {', '.join(self.proposal.channels)}",
+            f"## Inner Loop Results for Proposal #{p.proposal_id}",
+            f"- Channels: {', '.join(p.channels)}",
             f"- Final MSE loss: {self.final_loss:.2f}",
             f"- Pearson correlation: {self.pearson_r:.3f}",
-            f"- Simulated spikes: {self.n_sim_spikes}, Target spikes: {self.n_target_spikes}",
-            "",
-            "## Diagnostic Issues:",
+            f"- Simulated spikes: {self.n_sim_spikes}, "
+            f"Target spikes: {self.n_target_spikes}",
         ]
+
+        if p.fitted_params:
+            lines.append("\n## Fitted Parameters:")
+            for k, v in p.fitted_params.items():
+                lines.append(f"  {k}: {v:.6f}")
+
+        lines.append("\n## Diagnostic Issues:")
 
         if self.no_spikes:
             lines.append(
                 "- MODEL DOES NOT SPIKE: The simulation produced 0 spikes "
-                "while the target has spikes. This suggests Na conductance is "
-                "too low, the cell geometry gives insufficient current density, "
-                "or a necessary depolarising current is missing."
+                "while the target has spikes. This suggests Na conductance "
+                "is too low, the cell geometry gives insufficient current "
+                "density, or a necessary depolarising current is missing."
             )
 
-        if self.wrong_firing_rate and not self.no_spikes:
-            rate_ratio = self.n_sim_spikes / max(self.n_target_spikes, 1)
-            if rate_ratio < 0.5:
+        if self.wrong_firing_rate:
+            ratio = self.n_sim_spikes / max(self.n_target_spikes, 1)
+            if ratio < 0.5:
                 lines.append(
-                    f"- FIRING RATE TOO LOW: {self.n_sim_spikes} vs {self.n_target_spikes} "
-                    "target spikes. Consider increasing Na conductance or adding "
-                    "a fast-activating K+ channel (Kv3) that enables rapid repolarisation."
+                    f"- FIRING RATE TOO LOW: {self.n_sim_spikes} vs "
+                    f"{self.n_target_spikes} target. Consider increasing "
+                    f"Na conductance, decreasing K conductance, or adding "
+                    f"a depolarising current."
                 )
-            elif rate_ratio > 2.0:
+            else:
                 lines.append(
-                    f"- FIRING RATE TOO HIGH: {self.n_sim_spikes} vs {self.n_target_spikes} "
-                    "target spikes. Consider adding adaptation currents (I_M or I_AHP) "
-                    "or increasing leak conductance."
+                    f"- FIRING RATE TOO HIGH: {self.n_sim_spikes} vs "
+                    f"{self.n_target_spikes} target. Consider increasing "
+                    f"K conductance or adding adaptation (IM, IAHP)."
                 )
 
         if self.broad_spikes:
             lines.append(
-                "- SPIKE WIDTH TOO BROAD: Consider adding Kv3-type fast delayed "
-                "rectifier for rapid repolarisation (characteristic of PV+ FS neurons)."
+                "- BROAD SPIKES: Spike width is too large. Consider adding "
+                "Kv3 for faster repolarisation."
             )
 
         if self.excessive_sag:
             lines.append(
-                "- EXCESSIVE SAG during hyperpolarisation: I_h conductance may be "
-                "too high. Consider removing IH or reducing its conductance."
+                "- EXCESSIVE SAG: Model hyperpolarises too much. Consider "
+                "reducing IH or adjusting leak reversal potential."
             )
 
         if self.parameters_at_bounds:
+            lines.append(f"- PARAMETERS AT BOUNDS: {self.parameters_at_bounds}")
             lines.append(
-                f"- PARAMETERS AT BOUNDS: {', '.join(self.parameters_at_bounds)}. "
                 "These parameters hit their optimisation limits, suggesting the "
-                "model structure may need revision."
+                "model structure may need revision or bounds should be widened."
             )
 
         if not any([self.no_spikes, self.wrong_firing_rate,
                     self.broad_spikes, self.excessive_sag]):
-            lines.append("- No major structural issues detected. "
-                        "Consider fine-tuning or trying different channel combinations.")
+            lines.append(
+                "- No major structural issues detected. "
+                "Consider fine-tuning or trying different channel combinations."
+            )
 
         return "\n".join(lines)
 
 
 # ===========================================================================
-# 4. Prompt Templates — neuroscience-specific LLM prompts
+# 4. Prompt Templates
 # ===========================================================================
 
 SYSTEM_PROMPT = """You are a computational neuroscience expert specialising in
 Hodgkin-Huxley-type biophysical models of cortical neurons. You are working with
-the BrainPy differentiable simulation framework to discover optimal HH model
+the Jaxley differentiable simulation framework to discover optimal HH model
 structures for specific cortical neuron types from the Allen Cell Types Database.
 
 Your task is to propose and iteratively refine the ion channel composition of
 single-compartment neuron models. You have access to these channels:
 
-BUILT-IN (BrainPy):
-- Na: Standard Hodgkin-Huxley sodium channel (fast transient) — bp.dyn.INa_HH1952
-- K: Standard HH delayed rectifier potassium channel — bp.dyn.IK_HH1952
-- Leak: Passive leak conductance — bp.dyn.IL
+BUILT-IN (Jaxley):
+- Na: Standard Hodgkin-Huxley sodium channel (fast transient)
+- K: Standard HH delayed rectifier potassium channel
+- Leak: Passive leak conductance
 
 CUSTOM LIBRARY:
 - Kv3: Fast delayed rectifier K+ (Kv3/Shaw). Enables high-frequency firing in PV+ FS cells.
+       Key param: Kv3_gKv3, typical range 1e-4 to 0.1 S/cm²
 - IM: Muscarinic M-type K+ (KCNQ/Kv7). Produces spike-frequency adaptation.
+      Key param: IM_gM, typical range 1e-6 to 1e-3 S/cm²
 - IAHP: Ca²⁺-dependent K+ (medium AHP). Mediates afterhyperpolarisation.
+        Key param: IAHP_gAHP, typical range 1e-6 to 1e-3 S/cm²
 - IT: T-type Ca²⁺ (low-voltage-activated). Rebound bursting in SST+ cells.
+      Key param: IT_gT, typical range 1e-5 to 1e-2 S/cm²
 - ICaL: L-type Ca²⁺ (high-voltage-activated). Sustained calcium entry.
+        Key param: ICaL_gCaL, typical range 1e-5 to 1e-2 S/cm²
 - IH: HCN (I_h). Sag and rebound on hyperpolarisation.
+      Key param: IH_gH, typical range 1e-6 to 1e-3 S/cm²
+
+IMPORTANT CONSTRAINTS:
+- Na, K, and Leak are always required and will be auto-inserted.
+- Radius should be 5-15 µm (soma-like). Too large dilutes injected current.
+- Capacitance should be 0.5-2.0 µF/cm². Too large slows dynamics.
+- The optimizer uses sigmoid-bounded gradient descent. Don't set extreme bounds.
 
 Always respond with a JSON object containing:
 {
-    "channels": ["Na", "K", "Leak", ...],
+    "channels": ["Na", "K", "Leak", ...additional channels...],
     "param_config": {
         "Na_gNa": {"init": 0.5, "lower": 0.05, "upper": 5.0},
         ...
     },
-    "radius": 15.0,
+    "radius": 10.0,
     "capacitance": 1.0,
     "rationale": "Explanation of structural choices..."
 }
@@ -332,10 +290,7 @@ Always respond with a JSON object containing:
 
 
 def make_initial_prompt(neuron_metadata: dict, ephys_features: dict) -> str:
-    """
-    Build the Stage 1 prompt: propose initial model structure given
-    neuron metadata and electrophysiology features.
-    """
+    """Build the Stage 1 prompt: propose initial model structure."""
     return f"""## Task: Propose an initial HH model structure
 
 ## Neuron Metadata:
@@ -355,10 +310,7 @@ Respond with a JSON object as specified in your instructions."""
 
 def make_revision_prompt(diagnostic: DiagnosticReport,
                          heap_summary: str) -> str:
-    """
-    Build the Stage 2 outer-loop prompt: revise model based on
-    inner-loop diagnostic feedback.
-    """
+    """Build the Stage 2 outer-loop prompt: revise model based on feedback."""
     feedback = diagnostic.generate_feedback()
 
     return f"""## Task: Revise the model structure based on fitting results
@@ -370,44 +322,55 @@ def make_revision_prompt(diagnostic: DiagnosticReport,
 
 Based on the diagnostic feedback above, propose a REVISED model structure.
 You may:
-- Add channels that address identified issues
+- Add channels that address identified issues (e.g. Kv3 for broad spikes)
 - Remove channels that are unnecessary
 - Adjust parameter ranges and initial values
-- Modify cell geometry
+- Modify cell geometry (radius, capacitance)
 
-Explain your reasoning for each structural change.
+Focus on the most critical issue first. Explain your reasoning.
 Respond with a JSON object as specified in your instructions."""
 
 
 # ===========================================================================
-# 5. Outer Loop — orchestrates the bilevel optimisation
+# 5. Outer Loop
 # ===========================================================================
 
 class OuterLoop:
     """
     The SGA-style outer loop that orchestrates:
     1. LLM proposes model structure (or revises based on feedback)
-    2. Inner loop (BrainPy gradient descent) optimises parameters
+    2. Inner loop (Jaxley gradient descent) optimises parameters
     3. Diagnostics generated from fitting results
     4. Results pushed to top-K heap
     5. LLM receives feedback and proposes revision
-
-    Based on SGA's bilevel zigzag pattern.
     """
 
     def __init__(self, specimen_id: int, data_dir: str,
                  api_key: str = None, model: str = "claude-sonnet-4-20250514",
                  top_k: int = 5, provider: str = "anthropic",
-                 inner_epochs: int = 80, inner_lr: float = 0.02):
+                 inner_epochs: int = 300, inner_lr: float = 0.02):
         self.specimen_id = specimen_id
         self.data_dir = Path(data_dir)
-        self.api_key = api_key
         self.model = model
         self.provider = provider
         self.heap = TopKHeap(k=top_k)
         self.history: list[dict] = []
         self.inner_epochs = inner_epochs
         self.inner_lr = inner_lr
+
+        # Resolve API key: explicit arg > env var (loaded from .env by dotenv)
+        if api_key:
+            self.api_key = api_key
+        elif provider == "anthropic":
+            self.api_key = os.environ.get("ANTHROPIC_API_KEY")
+        else:
+            self.api_key = os.environ.get("OPENAI_API_KEY")
+
+        if not self.api_key:
+            raise ValueError(
+                "No API key found. Set ANTHROPIC_API_KEY in .env file, "
+                "environment, or pass api_key= directly."
+            )
 
     def _call_llm(self, system: str, user: str) -> str:
         """Call the LLM API. Supports Anthropic and OpenAI."""
@@ -441,7 +404,6 @@ class OuterLoop:
     def _parse_proposal(self, llm_response: str, iteration: int,
                         parent_id: Optional[int] = None) -> ModelProposal:
         """Parse LLM JSON response into a ModelProposal."""
-        # Extract JSON from response (handle markdown code blocks)
         text = llm_response.strip()
         if "```json" in text:
             text = text.split("```json")[1].split("```")[0].strip()
@@ -453,8 +415,8 @@ class OuterLoop:
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse LLM response as JSON: {e}")
             logger.error(f"Response was: {llm_response[:500]}")
-            # Return a safe default
-            data = {"channels": ["Na", "K", "Leak"], "rationale": "Parse failed"}
+            data = {"channels": ["Na", "K", "Leak"],
+                    "rationale": f"JSON parse failed: {e}"}
 
         return ModelProposal(
             proposal_id=self.heap.next_id(),
@@ -462,7 +424,7 @@ class OuterLoop:
             parent_id=parent_id,
             channels=data.get("channels", ["Na", "K", "Leak"]),
             param_config=data.get("param_config", {}),
-            radius=data.get("radius", 15.0),
+            radius=data.get("radius", 10.0),
             length=data.get("length", 31.4),
             capacitance=data.get("capacitance", 1.0),
             rationale=data.get("rationale", ""),
@@ -470,11 +432,9 @@ class OuterLoop:
 
     def _run_inner_loop(self, proposal: ModelProposal) -> DiagnosticReport:
         """
-        Run the BrainPy inner loop for a proposal.
-
+        Run the Jaxley inner loop for a proposal.
         Calls general_fit.fit_proposal() which dynamically builds a
-        BrainPy neuron from the proposal's channel list, runs gradient
-        descent, and returns a DiagnosticReport with real fitting results.
+        Jaxley neuron, runs gradient descent, returns a DiagnosticReport.
         """
         logger.info(f"  Inner loop for proposal #{proposal.proposal_id}: "
                     f"{proposal.channels}")
@@ -496,6 +456,12 @@ class OuterLoop:
         """
         Run the full outer loop for up to max_iterations.
 
+        Each iteration:
+          1. LLM proposes (iter 0) or revises (iter >0) model structure
+          2. Inner loop fits the proposed model via gradient descent
+          3. Diagnostics are computed and fed back to the LLM
+          4. Result is pushed to the top-K heap
+
         Returns the best proposal from the heap.
         """
         if neuron_metadata is None:
@@ -511,7 +477,10 @@ class OuterLoop:
                 "note": "Load from pv_ephys_features.csv for this specimen",
             }
 
-        logger.info(f"Starting outer loop: max {max_iterations} iterations")
+        logger.info(f"Starting outer loop: max {max_iterations} iterations, "
+                    f"specimen {self.specimen_id}")
+
+        last_diagnostic = None
 
         for iteration in range(max_iterations):
             logger.info(f"\n{'='*60}")
@@ -523,46 +492,74 @@ class OuterLoop:
                 prompt = make_initial_prompt(neuron_metadata, ephys_features)
                 parent_id = None
             else:
-                best = self.heap.best()
-                diagnostic = self._run_inner_loop(best)
-                prompt = make_revision_prompt(diagnostic, self.heap.summary())
-                parent_id = best.proposal_id
+                # Use the diagnostic from the PREVIOUS iteration
+                prompt = make_revision_prompt(
+                    last_diagnostic, self.heap.summary())
+                parent_id = last_diagnostic.proposal.proposal_id
 
             logger.info("  Calling LLM for proposal...")
             try:
                 response = self._call_llm(SYSTEM_PROMPT, prompt)
                 proposal = self._parse_proposal(response, iteration, parent_id)
                 logger.info(f"  LLM proposed: {proposal.channels}")
-                logger.info(f"  Rationale: {proposal.rationale[:200]}")
+                logger.info(f"  Rationale: {proposal.rationale[:300]}")
             except Exception as e:
                 logger.error(f"  LLM call failed: {e}")
-                continue
+                # On LLM failure, retry with a safe default
+                proposal = ModelProposal(
+                    proposal_id=self.heap.next_id(),
+                    iteration=iteration,
+                    channels=["Na", "K", "Leak", "Kv3"],
+                    rationale=f"Fallback after LLM error: {e}",
+                )
 
-            # ---- Step 2: Inner loop ----
-            diagnostic = self._run_inner_loop(proposal)
+            # ---- Step 2: Inner loop — fit the proposal ----
+            try:
+                diagnostic = self._run_inner_loop(proposal)
+            except Exception as e:
+                logger.error(f"  Inner loop crashed: {e}")
+                diagnostic = DiagnosticReport(
+                    proposal=proposal,
+                    specimen_id=self.specimen_id,
+                    final_loss=float("inf"),
+                    no_spikes=True,
+                )
+
             proposal.loss = diagnostic.final_loss
             proposal.diagnostics = asdict(diagnostic)
+            last_diagnostic = diagnostic
 
             # ---- Step 3: Push to heap ----
             self.heap.push(proposal)
 
-            # ---- Log ----
+            # ---- Step 4: Log history ----
             self.history.append({
                 "iteration": iteration,
                 "proposal": asdict(proposal),
                 "diagnostic_feedback": diagnostic.generate_feedback(),
             })
 
+            logger.info(f"\n  Loss: {diagnostic.final_loss:.2f}, "
+                        f"Spikes: {diagnostic.n_sim_spikes}/{diagnostic.n_target_spikes}, "
+                        f"r={diagnostic.pearson_r:.3f}")
             logger.info(f"\n{self.heap.summary()}")
 
-            # ---- Early stopping: check if good enough ----
+            # ---- Step 5: Early stopping ----
             best = self.heap.best()
-            if best and best.diagnostics.get("model_spikes") and \
-               best.diagnostics.get("firing_rate_error", 1.0) < 0.2:
-                logger.info("  Fit is good enough — stopping early.")
-                break
+            if best and best.loss < float("inf"):
+                best_diag = best.diagnostics
+                has_spikes = best_diag.get("model_spikes", False)
+                n_sim = best_diag.get("n_sim_spikes", 0)
+                n_tgt = best_diag.get("n_target_spikes", 1)
+                if has_spikes and n_tgt > 0:
+                    rate_error = abs(n_sim - n_tgt) / n_tgt
+                    if rate_error < 0.2 and best_diag.get("pearson_r", 0) > 0.8:
+                        logger.info(
+                            f"  ✓ Good fit found (rate_error={rate_error:.2f}, "
+                            f"r={best_diag.get('pearson_r', 0):.3f}) — stopping early.")
+                        break
 
-        # Save history
+        # ---- Save history ----
         history_path = self.data_dir / "sga_history.json"
         with open(history_path, "w") as f:
             json.dump(self.history, f, indent=2, default=str)
@@ -606,15 +603,4 @@ if __name__ == "__main__":
     )
     print("\n" + diag.generate_feedback())
 
-    # Test code generation
-    p = ModelProposal(
-        channels=["Na", "K", "Leak", "Kv3", "IM"],
-        param_config={
-            "Na_gNa": {"init": 0.5, "lower": 0.05, "upper": 5.0},
-            "Kv3_gKv3": {"init": 0.01, "lower": 1e-4, "upper": 0.1},
-        },
-        radius=15.0,
-        rationale="PV+ FS cell needs Kv3 for fast repolarisation",
-    )
-    print("\nGenerated BrainPy code:")
-    print(p.to_brainpy_code())
+    print("\n✓ Component test passed")
