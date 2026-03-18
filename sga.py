@@ -318,7 +318,7 @@ IMPORTANT CONSTRAINTS:
  
 If you do NOT specify a parameter in param_config, these defaults are used:
  
-  Na_gNa:      init=0.5,  lower=0.05,  upper=15.0
+  Na_gNa:      init=10.0,  lower=0.1,  upper=100.0
   K_gK:        init=0.2,  lower=0.01,  upper=2.0
   Leak_gLeak:  init=0.001, lower=1e-5, upper=0.01
   Leak_eLeak:  init=-65,  lower=-75,   upper=-50
@@ -328,10 +328,10 @@ If you do NOT specify a parameter in param_config, these defaults are used:
   IT_gT:       init=1e-4, lower=1e-5,  upper=1e-2
   ICaL_gCaL:   init=1e-4, lower=1e-5,  upper=1e-2
   IH_gH:       init=1e-5, lower=1e-6,  upper=1e-3
-  eNa:         init=50,   lower=40,    upper=70
-  eK:          init=-77,  lower=-90,   upper=-70
+  eNa:         init=53,   lower=40,    upper=80
+  eK:          init=-80,  lower=-100,   upper=-70
   capacitance: init=1.0,  lower=0.5,   upper=2.0
-  radius:      init=10.0, lower=5.0,   upper=15.0
+  radius:      init=8.0, lower=3.0,   upper=20.0
  
 ## USING param_config TO OVERRIDE BOUNDS
  
@@ -358,7 +358,7 @@ BOTH the conductance AND reversal potential bounds:
 {
     "channels": ["Na", "K", "Leak", "Kv3"],
     "param_config": {
-        "Na_gNa":  {"init": 3.0, "lower": 0.1, "upper": 15.0},
+        "Na_gNa":  {"init": 10.0, "lower": 0.1, "upper": 100.0},
         "K_gK":    {"init": 0.3, "lower": 0.01, "upper": 3.0},
         "Kv3_gKv3": {"init": 0.02, "lower": 1e-4, "upper": 0.5},
         "eNa":     {"init": 55.0, "lower": 45.0, "upper": 75.0},

@@ -80,30 +80,51 @@ CUSTOM_CHANNELS = {
 ALL_CHANNELS = {**BUILTIN_CHANNELS, **CUSTOM_CHANNELS}
 
 # Default parameter bounds per channel when the proposal doesn't specify them.
-# These are biophysically reasonable ranges from the proposal + Pospischil (2008).
-# Bounds are deliberately tighter than the full biophysical range to prevent
-# the optimizer from "cheating" (e.g. inflating radius to dilute current,
-# shifting reversal potentials to extremes instead of learning to spike).
+#
+# UNITS: S/cm² for conductances (Jaxley/NEURON convention).
+# Reference values from Pospischil et al. (2008) Table 1:
+#   FS cell:  gNa=0.058, gKd=0.0039, gLeak=3.8e-5, gM=0 S/cm²
+#   RS cell:  gNa=0.050, gKd=0.005,  gLeak=1.0e-5, gM=7e-5 S/cm²
+#
+# Init values are centered near Pospischil FS parameters.
+# Bounds span roughly 0.1x–10x the typical value to give the optimizer
+# room without leaving the biophysically plausible regime.
+# Previous bounds had inits 100–2000× too large (e.g. Na_gNa init=0.5 vs
+# typical 0.05), causing massive currents, depolarization block, and NaN.
 DEFAULT_PARAM_BOUNDS = {
-    # Conductances — wide enough for FS cells
-    "Na_gNa":       {"init": 0.5,   "lower": 0.05,  "upper": 15.0},
-    "K_gK":         {"init": 0.2,   "lower": 0.01,  "upper": 2.0},
-    "Leak_gLeak":   {"init": 0.001, "lower": 1e-5,  "upper": 0.01},
-    "Leak_eLeak":   {"init": -65.0, "lower": -75.0, "upper": -50.0},
-    # Custom channels
-    "Kv3_gKv3":     {"init": 0.01,  "lower": 1e-4,  "upper": 0.1},
-    "IM_gM":        {"init": 1e-4,  "lower": 1e-6,  "upper": 1e-3},
-    "IAHP_gAHP":    {"init": 1e-4,  "lower": 1e-6,  "upper": 1e-3},
-    "IT_gT":        {"init": 1e-4,  "lower": 1e-5,  "upper": 1e-2},
-    "ICaL_gCaL":    {"init": 1e-4,  "lower": 1e-5,  "upper": 1e-2},
-    "IH_gH":        {"init": 1e-5,  "lower": 1e-6,  "upper": 1e-3},
-    # Reversal potentials — tighter to prevent optimizer cheating
-    "eNa":          {"init": 50.0,  "lower": 40.0,  "upper": 70.0},
-    "eK":           {"init": -77.0, "lower": -90.0, "upper": -70.0},
-    # Geometry — tighter radius prevents current dilution
-    "capacitance":  {"init": 1.0,   "lower": 0.5,   "upper": 2.0},
-    "radius":       {"init": 10.0,  "lower": 5.0,   "upper": 15.0},
+    # --- Core conductances (S/cm²) ---
+    # Na: Pospischil FS = 0.058; allow up to ~0.5 for atypical cells
+    "Na_gNa":       {"init": 0.05,   "lower": 0.005,   "upper": 0.5},
+    # Kd (delayed rectifier): Pospischil FS = 0.0039
+    "K_gK":         {"init": 0.005,  "lower": 0.0005,  "upper": 0.05},
+    # Leak: Pospischil FS = 3.8e-5
+    "Leak_gLeak":   {"init": 5e-5,   "lower": 1e-6,    "upper": 5e-4},
+    "Leak_eLeak":   {"init": -65.0,  "lower": -80.0,   "upper": -50.0},
+    # --- Custom channels (S/cm²) ---
+    # Kv3: Erisir 1999 ~ 0.01–0.03 for FS cells
+    "Kv3_gKv3":     {"init": 0.01,   "lower": 1e-4,    "upper": 0.1},
+    # IM: not present in FS cells (gM=0), small for RS (~7e-5)
+    "IM_gM":        {"init": 1e-5,   "lower": 1e-7,    "upper": 1e-3},
+    # IAHP: typically small
+    "IAHP_gAHP":    {"init": 1e-5,   "lower": 1e-7,    "upper": 1e-3},
+    # IT: T-type Ca2+ for LTS cells
+    "IT_gT":        {"init": 1e-4,   "lower": 1e-6,    "upper": 1e-2},
+    # ICaL: L-type Ca2+
+    "ICaL_gCaL":    {"init": 1e-4,   "lower": 1e-6,    "upper": 1e-2},
+    # IH: HCN current
+    "IH_gH":        {"init": 1e-5,   "lower": 1e-7,    "upper": 1e-3},
+    # --- Reversal potentials (mV) ---
+    "eNa":          {"init": 50.0,   "lower": 40.0,    "upper": 65.0},
+    "eK":           {"init": -85.0,  "lower": -100.0,  "upper": -70.0},
+    # --- Geometry ---
+    "capacitance":  {"init": 1.0,    "lower": 0.5,     "upper": 2.0},
+    "radius":       {"init": 10.0,   "lower": 5.0,     "upper": 15.0},
 }
+
+# Maximum factor by which LLM-proposed bounds can exceed defaults.
+# 5× is generous enough for the optimizer but prevents NaN-causing extremes
+# like Na_gNa=120 S/cm² (which should be ~0.05).
+_LLM_BOUND_CLAMP_FACTOR = 5.0
 
 # Map channel names to their conductance parameter names.
 # This is needed so we know what to make trainable for each channel.
@@ -126,6 +147,69 @@ GLOBAL_TRAINABLE = ["eNa", "eK", "capacitance", "radius"]
 # ===========================================================================
 # Build Cell from Proposal
 # ===========================================================================
+
+def _clamp_param_bounds(param_name: str, cfg: dict) -> dict:
+    """
+    Clamp LLM-proposed bounds to within safe distance of defaults.
+    This prevents the LLM from proposing wildly wrong values
+    (e.g. Na_gNa upper=120 when the correct scale is ~0.5 S/cm²).
+
+    Strategy:
+      - Conductances (params containing '_g'): multiplicative clamping.
+        upper capped at default_upper * factor, lower floored at default_lower / factor.
+      - Everything else (reversal potentials, geometry): additive clamping.
+        Allowed to deviate by at most factor × default_range from defaults.
+
+    Returns a new dict with clamped values (does not mutate input).
+    """
+    if param_name not in DEFAULT_PARAM_BOUNDS:
+        return cfg
+
+    default = DEFAULT_PARAM_BOUNDS[param_name]
+    clamped = dict(cfg)  # shallow copy
+    factor = _LLM_BOUND_CLAMP_FACTOR
+
+    d_lower = default["lower"]
+    d_upper = default["upper"]
+    d_range = abs(d_upper - d_lower)
+
+    # Conductance params: use multiplicative clamping
+    is_conductance = "_g" in param_name
+    if is_conductance and d_lower > 0:
+        max_upper = d_upper * factor
+        min_lower = d_lower / factor
+    else:
+        # Reversal potentials, geometry: use additive clamping
+        max_upper = d_upper + factor * d_range
+        min_lower = d_lower - factor * d_range
+        # But for reversal potentials, also enforce hard biophysical limits
+        if param_name == "eNa":
+            max_upper = min(max_upper, 80.0)   # Na reversal never > +80 mV
+        elif param_name == "eK":
+            min_lower = max(min_lower, -110.0)  # K reversal never < -110 mV
+        elif param_name == "radius":
+            max_upper = min(max_upper, 25.0)    # soma radius never > 25 µm
+            min_lower = max(min_lower, 2.0)     # never < 2 µm
+
+    if "upper" in clamped and clamped["upper"] > max_upper:
+        logger.warning(
+            f"  Clamping {param_name} upper: "
+            f"{clamped['upper']} -> {max_upper}")
+        clamped["upper"] = max_upper
+    if "lower" in clamped and clamped["lower"] < min_lower:
+        logger.warning(
+            f"  Clamping {param_name} lower: "
+            f"{clamped['lower']} -> {min_lower}")
+        clamped["lower"] = min_lower
+
+    # Clamp init to stay within [lower, upper]
+    if "init" in clamped:
+        lo = clamped.get("lower", d_lower)
+        hi = clamped.get("upper", d_upper)
+        clamped["init"] = max(lo, min(hi, clamped["init"]))
+
+    return clamped
+
 
 def build_cell_from_proposal(proposal: ModelProposal) -> tuple:
     """
@@ -169,7 +253,9 @@ def build_cell_from_proposal(proposal: ModelProposal) -> tuple:
         for ch_name in channels:
             for param_name in CHANNEL_CONDUCTANCE_PARAMS.get(ch_name, []):
                 if param_name in proposal.param_config:
-                    init_val = proposal.param_config[param_name].get("init")
+                    init_val = _clamp_param_bounds(
+                        param_name, proposal.param_config[param_name]
+                    ).get("init")
                 elif param_name in DEFAULT_PARAM_BOUNDS:
                     init_val = DEFAULT_PARAM_BOUNDS[param_name]["init"]
                 else:
@@ -182,32 +268,39 @@ def build_cell_from_proposal(proposal: ModelProposal) -> tuple:
     except Exception as e:
         return None, None, f"Cell construction failed: {e}\n{traceback.format_exc()}"
 
-    # Collect the list of trainable parameter names + their bounds
+    # ------------------------------------------------------------------
+    # Collect trainable parameters with CLAMPED bounds
+    # ------------------------------------------------------------------
     trainable = []
 
+    # Channel-specific conductance params
     for ch_name in channels:
         for param_name in CHANNEL_CONDUCTANCE_PARAMS.get(ch_name, []):
-            # Get bounds from proposal, then defaults
             if param_name in proposal.param_config:
-                cfg = proposal.param_config[param_name]
+                cfg = _clamp_param_bounds(param_name, proposal.param_config[param_name])
             elif param_name in DEFAULT_PARAM_BOUNDS:
                 cfg = DEFAULT_PARAM_BOUNDS[param_name]
             else:
                 continue
             trainable.append({
                 "name": param_name,
-                "lower": cfg.get("lower", cfg["init"] * 0.01),
-                "upper": cfg.get("upper", cfg["init"] * 100.0),
+                "lower": cfg["lower"],
+                "upper": cfg["upper"],
             })
 
+    # Global params (eNa, eK, capacitance, radius) — ALSO clamped
     for param_name in GLOBAL_TRAINABLE:
-        if param_name in DEFAULT_PARAM_BOUNDS:
-            cfg = proposal.param_config.get(param_name, DEFAULT_PARAM_BOUNDS[param_name])
-            trainable.append({
-                "name": param_name,
-                "lower": cfg.get("lower", DEFAULT_PARAM_BOUNDS[param_name]["lower"]),
-                "upper": cfg.get("upper", DEFAULT_PARAM_BOUNDS[param_name]["upper"]),
-            })
+        if param_name not in DEFAULT_PARAM_BOUNDS:
+            continue
+        if param_name in proposal.param_config:
+            cfg = _clamp_param_bounds(param_name, proposal.param_config[param_name])
+        else:
+            cfg = DEFAULT_PARAM_BOUNDS[param_name]
+        trainable.append({
+            "name": param_name,
+            "lower": cfg["lower"],
+            "upper": cfg["upper"],
+        })
 
     return comp, trainable, None
 
@@ -216,12 +309,49 @@ def build_cell_from_proposal(proposal: ModelProposal) -> tuple:
 # Build Loss Function (generalized)
 # ===========================================================================
 
-def build_generalized_loss_fn(cell, target_v, dt, transform, param_names):
+def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
+                              n_windows=6, stats_weight=2.0):
     """
-    Build a differentiable loss function for an arbitrary set of trainable
-    parameters. This generalizes jaxley_fit.py's build_loss_fn() which
-    hardcoded Na_gNa, K_gK, etc.
+    Build a differentiable loss function combining:
+      1. Waveform MSE (as before)
+      2. Windowed summary statistics — mean & std of voltage in temporal
+         windows, following the Jaxley paper (Deistler et al. 2025).
+
+    The windowed stats are critical because:
+      - Voltage std in the stimulus window is a differentiable proxy for
+        spiking activity (non-spiking → low std; spiking → high std).
+      - Mean voltage per window captures subthreshold dynamics + overall
+        depolarization level.
+      - Together they give the optimizer a smooth gradient toward the
+        spiking regime, unlike raw MSE which is dominated by subthreshold
+        mismatch when the model fails to spike.
+
+    Args:
+        n_windows:    Number of temporal windows to split the trace into.
+        stats_weight: Relative weight of summary-statistics loss vs MSE.
     """
+    # Pre-compute target summary statistics (non-differentiable, constants)
+    target_np = np.array(target_v)
+    n_total = len(target_np)
+    win_size = n_total // n_windows
+
+    target_means = []
+    target_stds = []
+    for w in range(n_windows):
+        start = w * win_size
+        end = start + win_size if w < n_windows - 1 else n_total
+        window = target_np[start:end]
+        target_means.append(float(np.mean(window)))
+        target_stds.append(float(np.std(window)))
+
+    # Convert to JAX arrays (constants in the loss)
+    tgt_means = jnp.array(target_means)
+    tgt_stds = jnp.array(target_stds)
+
+    # Normalisation factors (from Jaxley paper: divide means by 8, stds by 4)
+    mean_scale = 8.0
+    std_scale = 4.0
+
     def loss_fn(opt_params):
         params = transform.forward(opt_params)
 
@@ -234,11 +364,38 @@ def build_generalized_loss_fn(cell, target_v, dt, transform, param_names):
             v_sim = v[0]
 
             n = min(len(v_sim), len(target_v))
-            mse = jnp.mean((v_sim[:n] - target_v[:n]) ** 2)
-        except Exception:
-            mse = jnp.inf
+            v_s = v_sim[:n]
+            v_t = target_v[:n]
 
-        return mse
+            # --- Component 1: Waveform MSE ---
+            mse = jnp.mean((v_s - v_t) ** 2)
+
+            # --- Component 2: Windowed summary statistics ---
+            # Compute mean & std in each temporal window for the simulated trace
+            sim_means = []
+            sim_stds = []
+            for w in range(n_windows):
+                start = w * win_size
+                end = start + win_size if w < n_windows - 1 else n
+                win = v_s[start:end]
+                sim_means.append(jnp.mean(win))
+                sim_stds.append(jnp.std(win))
+
+            sim_means = jnp.stack(sim_means)
+            sim_stds = jnp.stack(sim_stds)
+
+            # MAE on normalised summary statistics (following Jaxley paper)
+            mean_loss = jnp.mean(jnp.abs(sim_means / mean_scale - tgt_means / mean_scale))
+            std_loss = jnp.mean(jnp.abs(sim_stds / std_scale - tgt_stds / std_scale))
+
+            stats_loss = mean_loss + std_loss
+
+            total = mse + stats_weight * stats_loss
+
+        except Exception:
+            total = jnp.array(float("inf"))
+
+        return total
 
     return loss_fn
 
