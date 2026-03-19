@@ -195,25 +195,30 @@ def build_hh_cell(dt: float = 0.025) -> jx.Compartment:
     comp.insert(K())
     comp.insert(Leak())
 
-    # Soma geometry: ~20 um diameter sphere
-    # For a sphere of diameter d, surface area = pi*d^2
-    # Jaxley compartment area = 2*pi*radius*length
-    # Set radius=10, length=10*pi ≈ 31.4 so area ≈ pi*(20)^2 ≈ 1257 um^2
-    comp.set("radius", 10.0)           # um
-    comp.set("length", 31.4)           # um (gives sphere-like area)
-    comp.set("axial_resistivity", 100.0)  # ohm*cm
-    comp.set("capacitance", 1.0)       # uF/cm^2
-
-    # Channel conductances — PV+ FS interneurons have very high Na/K density
-    comp.set("Na_gNa", 0.5)           # S/cm^2 (high for FS cells)
-    comp.set("K_gK", 0.2)             # S/cm^2 (high for FS cells)
-    comp.set("Leak_gLeak", 0.001)     # S/cm^2
-
-    # Reversal potentials (eNa and eK are global, not channel-prefixed)
-    comp.set("eNa", 50.0)             # mV
-    comp.set("eK", -77.0)             # mV
-    comp.set("Leak_eLeak", -60.0)     # mV
-
+    # Soma geometry: ~20 µm diameter sphere
+    # For a sphere of diameter d, surface area = π*d²
+    # Jaxley compartment area = 2*π*radius*length
+    # Set radius=10, length=10*π ≈ 31.4 so area ≈ π*(20)² ≈ 1257 µm²
+    comp.set("radius", 10.0)           # µm
+    comp.set("length", 31.4)           # µm (gives sphere-like area)
+    comp.set("axial_resistivity", 100.0)  # ohm·cm
+    comp.set("capacitance", 1.0)       # µF/cm²
+ 
+    # Channel conductances — USE JAXLEY DEFAULTS
+    # Empirically verified: produce spikes + finite gradients
+    # Jaxley default gNa=0.05 S/cm², gK=0.005 S/cm²
+    # DO NOT increase these to "PV+ FS high density" values like 0.5/0.2
+    # — those cause gradient overflow in backprop-through-time.
+    # The optimizer will find the right values within the safe bounds.
+    comp.set("Na_gNa", 0.05)          # S/cm² (Jaxley default, verified safe)
+    comp.set("K_gK", 0.005)           # S/cm² (Jaxley default, verified safe)
+    comp.set("Leak_gLeak", 0.0001)    # S/cm² (Jaxley default)
+ 
+    # Reversal potentials — USE JAXLEY DEFAULTS
+    comp.set("eNa", 50.0)             # mV (Jaxley default)
+    comp.set("eK", -90.0)             # mV (Jaxley default; was -77)
+    comp.set("Leak_eLeak", -70.0)     # mV (Jaxley default; was -60)
+ 
     return comp
 
 
@@ -345,14 +350,14 @@ def setup_simulation(cell: jx.Compartment, stimulus: np.ndarray,
 def get_sigmoid_transforms() -> ParamTransform:
     """Define sigmoid transforms with biophysical bounds for Na+K+Leak model."""
     transforms = [
-        {"Na_gNa": SigmoidTransform(lower=0.05, upper=5.0)},    # FS cells can be very high
-        {"K_gK": SigmoidTransform(lower=0.01, upper=2.0)},      # also high for FS
-        {"Leak_gLeak": SigmoidTransform(lower=1e-5, upper=0.05)},
-        {"Leak_eLeak": SigmoidTransform(lower=-80.0, upper=-40.0)},
-        {"capacitance": SigmoidTransform(lower=0.5, upper=3.0)},
-        {"eNa": SigmoidTransform(lower=30.0, upper=70.0)},
-        {"eK": SigmoidTransform(lower=-100.0, upper=-60.0)},
-        {"radius": SigmoidTransform(lower=3.0, upper=30.0)},    # controls effective area
+        {"Na_gNa": SigmoidTransform(lower=0.01, upper=0.20)},
+        {"K_gK": SigmoidTransform(lower=0.001, upper=0.05)},
+        {"Leak_gLeak": SigmoidTransform(lower=1e-5, upper=0.002)},
+        {"Leak_eLeak": SigmoidTransform(lower=-80.0, upper=-50.0)},
+        {"capacitance": SigmoidTransform(lower=0.5, upper=2.0)},
+        {"eNa": SigmoidTransform(lower=40.0, upper=65.0)},
+        {"eK": SigmoidTransform(lower=-100.0, upper=-70.0)},
+        {"radius": SigmoidTransform(lower=3.0, upper=20.0)},
     ]
     return ParamTransform(transforms)
 

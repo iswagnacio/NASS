@@ -92,33 +92,81 @@ ALL_CHANNELS = {**BUILTIN_CHANNELS, **CUSTOM_CHANNELS}
 # Previous bounds had inits 100–2000× too large (e.g. Na_gNa init=0.5 vs
 # typical 0.05), causing massive currents, depolarization block, and NaN.
 DEFAULT_PARAM_BOUNDS = {
-    # --- Core conductances (S/cm²) ---
-    # Na: Pospischil FS = 0.058; allow up to ~0.5 for atypical cells
-    "Na_gNa":       {"init": 0.05,   "lower": 0.005,   "upper": 0.5},
-    # Kd (delayed rectifier): Pospischil FS = 0.0039
-    "K_gK":         {"init": 0.005,  "lower": 0.0005,  "upper": 0.05},
-    # Leak: Pospischil FS = 3.8e-5
-    "Leak_gLeak":   {"init": 5e-5,   "lower": 1e-6,    "upper": 5e-4},
-    "Leak_eLeak":   {"init": -65.0,  "lower": -80.0,   "upper": -50.0},
-    # --- Custom channels (S/cm²) ---
-    # Kv3: Erisir 1999 ~ 0.01–0.03 for FS cells
-    "Kv3_gKv3":     {"init": 0.01,   "lower": 1e-4,    "upper": 0.1},
-    # IM: not present in FS cells (gM=0), small for RS (~7e-5)
-    "IM_gM":        {"init": 1e-5,   "lower": 1e-7,    "upper": 1e-3},
-    # IAHP: typically small
-    "IAHP_gAHP":    {"init": 1e-5,   "lower": 1e-7,    "upper": 1e-3},
-    # IT: T-type Ca2+ for LTS cells
-    "IT_gT":        {"init": 1e-4,   "lower": 1e-6,    "upper": 1e-2},
-    # ICaL: L-type Ca2+
-    "ICaL_gCaL":    {"init": 1e-4,   "lower": 1e-6,    "upper": 1e-2},
-    # IH: HCN current
-    "IH_gH":        {"init": 1e-5,   "lower": 1e-7,    "upper": 1e-3},
-    # --- Reversal potentials (mV) ---
-    "eNa":          {"init": 50.0,   "lower": 40.0,    "upper": 65.0},
-    "eK":           {"init": -85.0,  "lower": -100.0,  "upper": -70.0},
-    # --- Geometry ---
-    "capacitance":  {"init": 1.0,    "lower": 0.5,     "upper": 2.0},
-    "radius":       {"init": 10.0,   "lower": 5.0,     "upper": 15.0},
+    # --- Built-in channel conductances ---
+    "Na_gNa": {
+        "init": 0.05,           # Jaxley default (S/cm²)
+        "lower": 0.01,          # below this → marginal/no spiking
+        "upper": 0.20,          # above ~0.2 → gradient overflow risk
+    },
+    "K_gK": {
+        "init": 0.005,          # Jaxley default
+        "lower": 0.001,
+        "upper": 0.05,          # above ~0.05 → gradient overflow risk
+    },
+    "Leak_gLeak": {
+        "init": 0.0001,         # Jaxley default
+        "lower": 1e-5,
+        "upper": 0.002,         # too much leak kills spiking
+    },
+    "Leak_eLeak": {
+        "init": -70.0,          # Jaxley default (mV)
+        "lower": -80.0,
+        "upper": -50.0,
+    },
+ 
+    # --- Custom channel conductances (from channels.py) ---
+    "Kv3_gKv3": {
+        "init": 0.003,          # channels.py default
+        "lower": 5e-4,
+        "upper": 0.03,
+    },
+    "IM_gM": {
+        "init": 7e-5,           # Pospischil RS value (S/cm²)
+        "lower": 1e-6,
+        "upper": 0.005,
+    },
+    "IAHP_gAHP": {
+        "init": 1e-4,
+        "lower": 1e-6,
+        "upper": 0.005,
+    },
+    "IT_gT": {
+        "init": 1e-4,
+        "lower": 1e-6,
+        "upper": 0.005,
+    },
+    "ICaL_gCaL": {
+        "init": 1e-4,
+        "lower": 1e-6,
+        "upper": 0.005,
+    },
+    "IH_gH": {
+        "init": 2e-5,
+        "lower": 1e-6,
+        "upper": 0.001,
+    },
+ 
+    # --- Global parameters ---
+    "eNa": {
+        "init": 50.0,           # Jaxley default (mV)
+        "lower": 40.0,
+        "upper": 65.0,
+    },
+    "eK": {
+        "init": -90.0,          # Jaxley default (mV) — was -77, which is fine but -90 matches Jaxley
+        "lower": -100.0,
+        "upper": -70.0,
+    },
+    "capacitance": {
+        "init": 1.0,            # µF/cm²
+        "lower": 0.5,
+        "upper": 2.0,
+    },
+    "radius": {
+        "init": 10.0,           # µm
+        "lower": 3.0,
+        "upper": 20.0,
+    },
 }
 
 # Maximum factor by which LLM-proposed bounds can exceed defaults.
@@ -148,68 +196,111 @@ GLOBAL_TRAINABLE = ["eNa", "eK", "capacitance", "radius"]
 # Build Cell from Proposal
 # ===========================================================================
 
-def _clamp_param_bounds(param_name: str, cfg: dict) -> dict:
+# Maximum allowed upper bounds per parameter (gradient-safe ceilings).
+# These were determined empirically: values above these can cause NaN
+# in backprop-through-time on 46,000-step traces with float32.
+_HARD_UPPER_CEILINGS = {
+    "Na_gNa":     0.25,     # tested: 0.2 OK, 0.5 NaN
+    "K_gK":       0.08,     # tested: 0.05 OK, 0.2 NaN
+    "Leak_gLeak": 0.005,    # too much leak kills spiking
+    "Kv3_gKv3":   0.08,     # same order as K
+    "IM_gM":      0.01,
+    "IAHP_gAHP":  0.01,
+    "IT_gT":      0.01,
+    "ICaL_gCaL":  0.01,
+    "IH_gH":      0.005,
+}
+ 
+_HARD_LOWER_FLOORS = {
+    "eNa": 35.0,
+    "eK": -110.0,
+    "capacitance": 0.3,
+    "radius": 2.0,
+}
+ 
+_HARD_UPPER_CEILINGS_GLOBAL = {
+    "eNa": 70.0,
+    "eK": -65.0,
+    "capacitance": 3.0,
+    "radius": 25.0,
+}
+ 
+ 
+def _clamp_param_bounds(name: str, cfg: dict) -> dict:
     """
-    Clamp LLM-proposed bounds to within safe distance of defaults.
-    This prevents the LLM from proposing wildly wrong values
-    (e.g. Na_gNa upper=120 when the correct scale is ~0.5 S/cm²).
-
+    Clamp LLM-proposed parameter bounds to the gradient-safe regime.
+ 
+    The LLM may propose arbitrarily wide bounds (e.g., gNa upper = 120).
+    This function enforces hard ceilings determined by empirical gradient
+    stability testing on 46,000-step Jaxley simulations with float32.
+ 
     Strategy:
-      - Conductances (params containing '_g'): multiplicative clamping.
-        upper capped at default_upper * factor, lower floored at default_lower / factor.
-      - Everything else (reversal potentials, geometry): additive clamping.
-        Allowed to deviate by at most factor × default_range from defaults.
-
-    Returns a new dict with clamped values (does not mutate input).
+      - Conductances: enforce absolute ceiling from _HARD_UPPER_CEILINGS
+      - Reversal potentials: enforce absolute floor/ceiling
+      - Geometry: enforce absolute floor/ceiling
+      - Init values: clamp to [lower, upper] after bound clamping
+ 
+    Returns a new dict (does not mutate input).
     """
-    if param_name not in DEFAULT_PARAM_BOUNDS:
-        return cfg
+    cfg = dict(cfg)  # don't mutate caller's dict
+ 
+    # --- Conductance parameters: hard upper ceiling ---
+    if name in _HARD_UPPER_CEILINGS:
+        ceiling = _HARD_UPPER_CEILINGS[name]
+        if cfg.get("upper", ceiling) > ceiling:
+            logger.warning(f"  Clamping {name} upper: {cfg['upper']} -> {ceiling}")
+            cfg["upper"] = ceiling
+        # Also enforce that lower >= some minimum
+        default = DEFAULT_PARAM_BOUNDS.get(name, {})
+        min_lower = default.get("lower", cfg.get("lower", 0))
+        if cfg.get("lower", 0) < min_lower:
+            cfg["lower"] = min_lower
+ 
+    # --- Global parameters: hard floor/ceiling ---
+    if name in _HARD_LOWER_FLOORS:
+        floor = _HARD_LOWER_FLOORS[name]
+        if cfg.get("lower", floor) < floor:
+            logger.warning(f"  Clamping {name} lower: {cfg['lower']} -> {floor}")
+            cfg["lower"] = floor
+ 
+    if name in _HARD_UPPER_CEILINGS_GLOBAL:
+        ceiling = _HARD_UPPER_CEILINGS_GLOBAL[name]
+        if cfg.get("upper", ceiling) > ceiling:
+            logger.warning(f"  Clamping {name} upper: {cfg['upper']} -> {ceiling}")
+            cfg["upper"] = ceiling
+ 
+    # --- Ensure init is within [lower, upper] ---
+    if "init" in cfg:
+        cfg["init"] = max(cfg["init"], cfg.get("lower", cfg["init"]))
+        cfg["init"] = min(cfg["init"], cfg.get("upper", cfg["init"]))
+ 
+    # --- Sanity: lower < upper ---
+    if cfg.get("lower", 0) >= cfg.get("upper", float("inf")):
+        logger.warning(f"  {name}: lower >= upper ({cfg['lower']} >= {cfg['upper']}), "
+                       f"resetting to defaults")
+        default = DEFAULT_PARAM_BOUNDS.get(name, cfg)
+        cfg["lower"] = default.get("lower", cfg["lower"])
+        cfg["upper"] = default.get("upper", cfg["upper"])
+ 
+    return cfg
 
-    default = DEFAULT_PARAM_BOUNDS[param_name]
-    clamped = dict(cfg)  # shallow copy
-    factor = _LLM_BOUND_CLAMP_FACTOR
-
-    d_lower = default["lower"]
-    d_upper = default["upper"]
-    d_range = abs(d_upper - d_lower)
-
-    # Conductance params: use multiplicative clamping
-    is_conductance = "_g" in param_name
-    if is_conductance and d_lower > 0:
-        max_upper = d_upper * factor
-        min_lower = d_lower / factor
-    else:
-        # Reversal potentials, geometry: use additive clamping
-        max_upper = d_upper + factor * d_range
-        min_lower = d_lower - factor * d_range
-        # But for reversal potentials, also enforce hard biophysical limits
-        if param_name == "eNa":
-            max_upper = min(max_upper, 80.0)   # Na reversal never > +80 mV
-        elif param_name == "eK":
-            min_lower = max(min_lower, -110.0)  # K reversal never < -110 mV
-        elif param_name == "radius":
-            max_upper = min(max_upper, 25.0)    # soma radius never > 25 µm
-            min_lower = max(min_lower, 2.0)     # never < 2 µm
-
-    if "upper" in clamped and clamped["upper"] > max_upper:
-        logger.warning(
-            f"  Clamping {param_name} upper: "
-            f"{clamped['upper']} -> {max_upper}")
-        clamped["upper"] = max_upper
-    if "lower" in clamped and clamped["lower"] < min_lower:
-        logger.warning(
-            f"  Clamping {param_name} lower: "
-            f"{clamped['lower']} -> {min_lower}")
-        clamped["lower"] = min_lower
-
-    # Clamp init to stay within [lower, upper]
-    if "init" in clamped:
-        lo = clamped.get("lower", d_lower)
-        hi = clamped.get("upper", d_upper)
-        clamped["init"] = max(lo, min(hi, clamped["init"]))
-
-    return clamped
-
+def _ensure_init_margin(init_val, lower, upper, margin_frac=0.05):
+    """
+    Ensure init value is at least margin_frac away from sigmoid bounds.
+ 
+    When init == upper or init == lower, the SigmoidTransform's logit
+    maps to ±infinity, causing immediate NaN in the gradient.
+ 
+    Args:
+        init_val: proposed initial value
+        lower, upper: sigmoid bounds
+        margin_frac: fraction of range to keep as margin (default 5%)
+ 
+    Returns:
+        Clamped init value guaranteed to be inside [lower + margin, upper - margin]
+    """
+    margin = (upper - lower) * margin_frac
+    return float(max(lower + margin, min(upper - margin, init_val)))
 
 def build_cell_from_proposal(proposal: ModelProposal) -> tuple:
     """
@@ -247,7 +338,7 @@ def build_cell_from_proposal(proposal: ModelProposal) -> tuple:
 
         # Set reversal potentials
         comp.set("eNa", 50.0)
-        comp.set("eK", -77.0)
+        comp.set("eK", -90.0)
 
         # Set initial conductance values from proposal or defaults
         for ch_name in channels:
@@ -257,7 +348,8 @@ def build_cell_from_proposal(proposal: ModelProposal) -> tuple:
                         param_name, proposal.param_config[param_name]
                     ).get("init")
                 elif param_name in DEFAULT_PARAM_BOUNDS:
-                    init_val = DEFAULT_PARAM_BOUNDS[param_name]["init"]
+                    cfg = DEFAULT_PARAM_BOUNDS[param_name]
+                    init_val = _ensure_init_margin(cfg["init"], cfg["lower"], cfg["upper"])
                 else:
                     continue
                 try:
@@ -653,10 +745,12 @@ def fit_proposal(
         # Build sigmoid transforms from trainable bounds
         transforms = []
         for t_info in trainable:
+            bound_range = t_info["upper"] - t_info["lower"]
+            buffer = bound_range * 0.001  # 0.1% buffer prevents logit(0)/logit(1) → ±inf
             transforms.append({
                 t_info["name"]: SigmoidTransform(
-                    lower=t_info["lower"],
-                    upper=t_info["upper"],
+                    lower=t_info["lower"] - buffer,
+                    upper=t_info["upper"] + buffer,
                 )
             })
         transform = ParamTransform(transforms)

@@ -296,15 +296,15 @@ BUILT-IN (Jaxley):
  
 CUSTOM LIBRARY:
 - Kv3: Fast delayed rectifier K+ (Kv3/Shaw). Enables high-frequency firing in PV+ FS cells.
-       Key param: Kv3_gKv3, typical range 1e-4 to 0.1 S/cm²
+       Key param: Kv3_gKv3, typical range 5e-4 to 0.03 S/cm²
 - IM: Muscarinic M-type K+ (KCNQ/Kv7). Produces spike-frequency adaptation.
       Key param: IM_gM, typical range 1e-6 to 1e-3 S/cm²
 - IAHP: Ca²⁺-dependent K+ (medium AHP). Mediates afterhyperpolarisation.
         Key param: IAHP_gAHP, typical range 1e-6 to 1e-3 S/cm²
 - IT: T-type Ca²⁺ (low-voltage-activated). Rebound bursting in SST+ cells.
-      Key param: IT_gT, typical range 1e-5 to 1e-2 S/cm²
+      Key param: IT_gT, typical range 1e-6 to 0.005 S/cm²
 - ICaL: L-type Ca²⁺ (high-voltage-activated). Sustained calcium entry.
-        Key param: ICaL_gCaL, typical range 1e-5 to 1e-2 S/cm²
+        Key param: ICaL_gCaL, typical range 1e-6 to 0.005 S/cm²
 - IH: HCN (I_h). Sag and rebound on hyperpolarisation.
       Key param: IH_gH, typical range 1e-6 to 1e-3 S/cm²
  
@@ -314,24 +314,27 @@ IMPORTANT CONSTRAINTS:
 - Capacitance should be 0.5-2.0 µF/cm². Too large slows dynamics.
 - The optimizer uses sigmoid-bounded gradient descent. Don't set extreme bounds.
  
-## DEFAULT PARAMETER BOUNDS
+## PARAMETER UNITS AND RANGES:
  
-If you do NOT specify a parameter in param_config, these defaults are used:
+Jaxley uses S/cm² for all conductance densities (NOT mS/cm²).
+The following are Jaxley's built-in defaults and the SAFE optimization range.
+Values outside the "safe upper" can cause gradient overflow (NaN).
  
-  Na_gNa:      init=10.0,  lower=0.1,  upper=100.0
-  K_gK:        init=0.2,  lower=0.01,  upper=2.0
-  Leak_gLeak:  init=0.001, lower=1e-5, upper=0.01
-  Leak_eLeak:  init=-65,  lower=-75,   upper=-50
-  Kv3_gKv3:    init=0.01, lower=1e-4,  upper=0.1
-  IM_gM:       init=1e-4, lower=1e-6,  upper=1e-3
-  IAHP_gAHP:   init=1e-4, lower=1e-6,  upper=1e-3
-  IT_gT:       init=1e-4, lower=1e-5,  upper=1e-2
-  ICaL_gCaL:   init=1e-4, lower=1e-5,  upper=1e-2
-  IH_gH:       init=1e-5, lower=1e-6,  upper=1e-3
-  eNa:         init=53,   lower=40,    upper=80
-  eK:          init=-80,  lower=-100,   upper=-70
-  capacitance: init=1.0,  lower=0.5,   upper=2.0
-  radius:      init=8.0, lower=3.0,   upper=20.0
+PARAMETER BOUNDS (all conductances in S/cm²):
+  Na_gNa:      {default: 0.05,   lower: 0.01,   upper: 0.20}
+  K_gK:        {default: 0.005,  lower: 0.001,  upper: 0.05}
+  Leak_gLeak:  {default: 0.0001, lower: 1e-5,   upper: 0.002}
+  Leak_eLeak:  {default: -70.0,  lower: -80.0,  upper: -50.0}  (mV)
+  Kv3_gKv3:    {default: 0.003,  lower: 5e-4,   upper: 0.03}
+  IM_gM:       {default: 7e-5,   lower: 1e-6,   upper: 0.005}
+  IAHP_gAHP:   {default: 1e-4,   lower: 1e-6,   upper: 0.005}
+  IT_gT:       {default: 1e-4,   lower: 1e-6,   upper: 0.005}
+  ICaL_gCaL:   {default: 1e-4,   lower: 1e-6,   upper: 0.005}
+  IH_gH:       {default: 2e-5,   lower: 1e-6,   upper: 0.001}
+  eNa:         {default: 50.0,   lower: 40.0,   upper: 65.0}   (mV)
+  eK:          {default: -90.0,  lower: -100.0,  upper: -70.0}  (mV)
+  capacitance: {default: 1.0,    lower: 0.5,    upper: 2.0}    (µF/cm²)
+  radius:      {default: 10.0,   lower: 3.0,    upper: 20.0}   (µm)
  
 ## USING param_config TO OVERRIDE BOUNDS
  
@@ -349,7 +352,7 @@ Each entry must have all three fields: "init", "lower", "upper".
 ## EXAMPLE
  
 Suppose the feedback says:
-  "Na_gNa at upper bound (5.0)" and "eNa at upper bound (60.0)"
+  "Na_gNa at upper bound (0.2)" and "eNa at upper bound (65.0)"
  
 This means the model needs more sodium current. A good response would widen
 BOTH the conductance AND reversal potential bounds:
@@ -358,15 +361,15 @@ BOTH the conductance AND reversal potential bounds:
 {
     "channels": ["Na", "K", "Leak", "Kv3"],
     "param_config": {
-        "Na_gNa":  {"init": 10.0, "lower": 0.1, "upper": 100.0},
-        "K_gK":    {"init": 0.3, "lower": 0.01, "upper": 3.0},
-        "Kv3_gKv3": {"init": 0.02, "lower": 1e-4, "upper": 0.5},
-        "eNa":     {"init": 55.0, "lower": 45.0, "upper": 75.0},
-        "eK":      {"init": -80.0, "lower": -100.0, "upper": -65.0}
+        "Na_gNa":  {"init": 0.08, "lower": 0.02, "upper": 0.20},
+        "K_gK":    {"init": 0.008, "lower": 0.002, "upper": 0.04},
+        "Kv3_gKv3": {"init": 0.005, "lower": 5e-4, "upper": 0.05},
+        "eNa":     {"init": 52.0, "lower": 45.0, "upper": 65.0},
+        "eK":      {"init": -88.0, "lower": -100.0, "upper": -70.0}
     },
     "radius": 10.0,
     "capacitance": 1.0,
-    "rationale": "Na_gNa was stuck at its 5.0 upper bound — widened to 15.0 to allow the optimizer to find the needed conductance. Also widened eNa upper to 75 mV since it was constrained at 60 mV. Kept Kv3 for fast repolarisation but widened its upper bound for flexibility."
+    "rationale": "Na_gNa was at its upper bound — widened init toward 0.08 to give optimizer room. Kept Kv3 for fast repolarisation. All values in S/cm²."
 }
 ```
  
@@ -406,6 +409,10 @@ and parameter configurations. Consider:
 2. What conductance densities are appropriate?
 3. What cell geometry (radius) matches the expected soma size?
 
+Remember: All conductance values are in S/cm² (Jaxley convention).
+The classic HH value for Na is 0.12 S/cm², NOT 120.
+Propose bounds within the safe gradient range shown in system prompt.
+
 Respond with a JSON object as specified in your instructions."""
 
 
@@ -432,6 +439,10 @@ You may:
 2. THEN: Address structural issues (missing channels, wrong channel types)
 3. LAST: Fine-tune initial values and geometry
  
+Remember: All conductance values are in S/cm² (Jaxley convention).
+The classic HH value for Na is 0.12 S/cm², NOT 120.
+Propose bounds within the safe gradient range shown in system prompt.
+
 Focus on the most critical issue first. Explain your reasoning, especially
 for any bound changes.
 Respond with a JSON object as specified in your instructions."""

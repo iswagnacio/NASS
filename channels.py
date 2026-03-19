@@ -73,19 +73,27 @@ def _alpha_beta_from_inf_tau(x_inf, tau):
 class Kv3(Channel):
     """
     Kv3 (Shaw-related) fast delayed rectifier potassium channel.
-
+ 
     Critical for PV+ fast-spiking interneurons: enables rapid repolarisation
     and high-frequency firing. Key features:
         - High activation threshold (~-10 mV)
         - Very fast deactivation (τ ~ 1-2 ms)
         - No inactivation (or very slow)
-
+ 
     Kinetics from Erisir et al. (1999) J Neurophysiol, adapted to the
     Pospischil et al. (2008) framework.
-
+ 
     I_Kv3 = g_Kv3 * n² * (V - E_K)
+ 
+    GRADIENT SAFETY NOTE (March 2026):
+        - tau_n uses softabs (sqrt(x² + 1)) instead of jnp.abs to avoid
+          the non-differentiable kink at V = -16 mV. During a spike, V
+          crosses -16 mV on every upstroke and downstroke; 200+ spikes
+          means 400+ gradient discontinuities compounding through BPTT.
+        - tau_n is clipped to [0.1, 50.0] ms to prevent extreme rates
+          that can overflow float32 Jacobians.
     """
-
+ 
     def __init__(self, name=None):
         self.current_is_in_mA_per_cm2 = True
         super().__init__(name)
@@ -96,25 +104,33 @@ class Kv3(Channel):
             f"{self._name}_n": 0.0,
         }
         self.current_name = "i_Kv3"
-
+ 
     def update_states(self, states, dt, v, params):
         n = states[f"{self._name}_n"]
-
-        # Steady state and time constant
+ 
+        # Steady state — Boltzmann sigmoid (unchanged)
         n_inf = _sigmoid(v, -12.4, 6.8)
-        # Fast deactivation is the hallmark of Kv3
-        tau_n = 0.25 + 4.35 * _safe_exp(-jnp.abs(v + 16.0) / 40.0)
-
+ 
+        # Time constant — bell curve centered at V = -16 mV
+        # ORIGINAL (gradient-unsafe):
+        #   tau_n = 0.25 + 4.35 * _safe_exp(-jnp.abs(v + 16.0) / 40.0)
+        # FIXED: softabs avoids the non-differentiable kink at V = -16
+        soft_abs = jnp.sqrt((v + 16.0) ** 2 + 1.0)
+        tau_n = 0.25 + 4.35 * _safe_exp(-soft_abs / 40.0)
+ 
+        # Clamp tau to prevent extreme rates
+        tau_n = jnp.clip(tau_n, 0.1, 50.0)
+ 
         alpha, beta = _alpha_beta_from_inf_tau(n_inf, tau_n)
         new_n = solve_gate_exponential(n, dt, alpha, beta)
         return {f"{self._name}_n": new_n}
-
+ 
     def compute_current(self, states, v, params):
         n = states[f"{self._name}_n"]
         g = params[f"{self._name}_gKv3"] * n ** 2
         e_k = -85.0  # Kv3 reversal potential
         return g * (v - e_k)
-
+ 
     def init_state(self, v, params):
         n_inf = _sigmoid(v, -12.4, 6.8)
         return {f"{self._name}_n": n_inf}
