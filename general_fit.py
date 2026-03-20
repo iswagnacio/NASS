@@ -94,29 +94,31 @@ ALL_CHANNELS = {**BUILTIN_CHANNELS, **CUSTOM_CHANNELS}
 DEFAULT_PARAM_BOUNDS = {
     # --- Built-in channel conductances ---
     "Na_gNa": {
-        "init": 0.05,           # Jaxley default (S/cm²)
-        "lower": 0.01,          # below this → marginal/no spiking
-        "upper": 0.20,          # above ~0.2 → gradient overflow risk
+        "init": 0.10,           # Raised from 0.05: with Kv3 present, 0.05 produces
+                                # a non-spiking model with NaN gradients everywhere.
+                                # 0.10 is mid-range and guarantees initial spiking.
+        "lower": 0.01,
+        "upper": 0.20,
     },
     "K_gK": {
         "init": 0.005,          # Jaxley default
         "lower": 0.001,
-        "upper": 0.05,          # above ~0.05 → gradient overflow risk
+        "upper": 0.05,
     },
     "Leak_gLeak": {
         "init": 0.0001,         # Jaxley default
         "lower": 1e-5,
-        "upper": 0.002,         # too much leak kills spiking
+        "upper": 0.002,
     },
     "Leak_eLeak": {
         "init": -70.0,          # Jaxley default (mV)
-        "lower": -80.0,
+        "lower": -85.0,         # Widened from -80: optimizer consistently pins here
         "upper": -50.0,
     },
  
     # --- Custom channel conductances (from channels.py) ---
     "Kv3_gKv3": {
-        "init": 0.003,          # channels.py default
+        "init": 0.005,          # Raised from 0.003: closer to mid-range of bounds
         "lower": 5e-4,
         "upper": 0.03,
     },
@@ -148,13 +150,13 @@ DEFAULT_PARAM_BOUNDS = {
  
     # --- Global parameters ---
     "eNa": {
-        "init": 50.0,           # Jaxley default (mV)
+        "init": 55.0,           # Raised from 50: gives more Na driving force
         "lower": 40.0,
-        "upper": 65.0,
+        "upper": 70.0,          # Widened from 65: optimizer pins at 65 consistently
     },
     "eK": {
-        "init": -90.0,          # Jaxley default (mV) — was -77, which is fine but -90 matches Jaxley
-        "lower": -100.0,
+        "init": -90.0,          # Jaxley default (mV)
+        "lower": -110.0,        # Widened from -100: optimizer pins at -100 consistently
         "upper": -70.0,
     },
     "capacitance": {
@@ -219,7 +221,7 @@ _HARD_LOWER_FLOORS = {
 }
  
 _HARD_UPPER_CEILINGS_GLOBAL = {
-    "eNa": 70.0,
+    "eNa": 80.0,            # Widened from 70: iter 2 pinned at 65, iter 3 at 70
     "eK": -65.0,
     "capacitance": 3.0,
     "radius": 25.0,
@@ -402,30 +404,59 @@ def build_cell_from_proposal(proposal: ModelProposal) -> tuple:
 # ===========================================================================
 
 def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
-                              n_windows=6, stats_weight=2.0):
+                              n_windows=10, mse_weight=0.1,
+                              stats_weight=5.0,
+                              spike_count_weight=300.0,
+                              spike_threshold=-20.0):
     """
     Build a differentiable loss function combining:
-      1. Waveform MSE (as before)
-      2. Windowed summary statistics — mean & std of voltage in temporal
-         windows, following the Jaxley paper (Deistler et al. 2025).
+      1. Waveform MSE (downweighted — refinement term)
+      2. Windowed summary statistics (Deistler et al. 2025)
+      3. Differentiable spike count penalty
 
-    The windowed stats are critical because:
-      - Voltage std in the stimulus window is a differentiable proxy for
-        spiking activity (non-spiking → low std; spiking → high std).
-      - Mean voltage per window captures subthreshold dynamics + overall
-        depolarization level.
-      - Together they give the optimizer a smooth gradient toward the
-        spiking regime, unlike raw MSE which is dominated by subthreshold
-        mismatch when the model fails to spike.
+    LOSS HIERARCHY (by design):
+      spike_count >> windowed_stats >> MSE
+
+    WHY MSE IS DOWNWEIGHTED:
+      Each misaligned spike creates ~(170 mV)² = 28,900 mV² of MSE at
+      that timestep. 56 spikes × ~40 timesteps each = 2,240 timesteps
+      of potential mismatch, adding ~487 to the mean MSE. This makes
+      "don't spike" the optimal MSE strategy. Evidence: across 12 SGA
+      iterations the optimizer consistently inflated radius/capacitance
+      to suppress spiking, achieving r=0.67 with 0 spikes rather than
+      r=0.45 with 9 spikes — because the MSE reward for not spiking
+      dominated both the spike count penalty and windowed stats.
+
+      With mse_weight=0.1, a 487-point MSE advantage from not spiking
+      becomes only ~49 points, easily overcome by spike_count_weight=300
+      (penalty of 300 for 0 spikes vs 0 for 56 spikes).
 
     Args:
-        n_windows:    Number of temporal windows to split the trace into.
-        stats_weight: Relative weight of summary-statistics loss vs MSE.
+        n_windows:          Number of temporal windows for summary stats.
+                            10 windows over 1150 ms ≈ 115 ms each, roughly
+                            2 ISIs at 56 spikes/1150 ms. Fine enough to
+                            detect per-window firing rate differences.
+        mse_weight:         Weight of raw MSE. Low (0.1) by design — MSE
+                            is a waveform refinement signal, not the primary
+                            driver. The Jaxley paper uses summary stats only.
+        stats_weight:       Weight of windowed stats (mean + std per window).
+        spike_count_weight: Weight of spike count loss. At 0/56 spikes,
+                            penalty = 300. At 9/56, penalty = 222.
+                            Clearly dominates MSE savings from not spiking.
+        spike_threshold:    Voltage threshold for spike detection (mV).
     """
     # Pre-compute target summary statistics (non-differentiable, constants)
     target_np = np.array(target_v)
     n_total = len(target_np)
     win_size = n_total // n_windows
+
+    # Pre-compute target spike count
+    tgt_crossings = np.diff((target_np > spike_threshold).astype(int)) > 0
+    target_spike_count = max(float(np.sum(tgt_crossings)), 1.0)
+
+    logger.info(f"  Loss function: target_spikes={int(target_spike_count)}, "
+                f"mse_weight={mse_weight}, stats_weight={stats_weight}, "
+                f"spike_count_weight={spike_count_weight}")
 
     target_means = []
     target_stds = []
@@ -444,6 +475,10 @@ def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
     mean_scale = 8.0
     std_scale = 4.0
 
+    # Soft spike detection sharpness (mV^-1).
+    # k=0.5 gives a ~20 mV transition zone around threshold.
+    spike_k = 0.5
+
     def loss_fn(opt_params):
         params = transform.forward(opt_params)
 
@@ -459,11 +494,10 @@ def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
             v_s = v_sim[:n]
             v_t = target_v[:n]
 
-            # --- Component 1: Waveform MSE ---
+            # --- Component 1: Waveform MSE (refinement term) ---
             mse = jnp.mean((v_s - v_t) ** 2)
 
             # --- Component 2: Windowed summary statistics ---
-            # Compute mean & std in each temporal window for the simulated trace
             sim_means = []
             sim_stds = []
             for w in range(n_windows):
@@ -476,13 +510,20 @@ def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
             sim_means = jnp.stack(sim_means)
             sim_stds = jnp.stack(sim_stds)
 
-            # MAE on normalised summary statistics (following Jaxley paper)
             mean_loss = jnp.mean(jnp.abs(sim_means / mean_scale - tgt_means / mean_scale))
             std_loss = jnp.mean(jnp.abs(sim_stds / std_scale - tgt_stds / std_scale))
 
             stats_loss = mean_loss + std_loss
 
-            total = mse + stats_weight * stats_loss
+            # --- Component 3: Differentiable spike count loss ---
+            p = jax.nn.sigmoid(spike_k * (v_s - spike_threshold))
+            dp = jnp.diff(p)
+            soft_count = jnp.sum(jax.nn.relu(dp))
+            spike_loss = (soft_count / target_spike_count - 1.0) ** 2
+
+            total = (mse_weight * mse
+                     + stats_weight * stats_loss
+                     + spike_count_weight * spike_loss)
 
         except Exception:
             total = jnp.array(float("inf"))
@@ -771,83 +812,147 @@ def fit_proposal(
     logger.info(f"  Trainable parameters ({len(param_names)}): {param_names}")
  
     loss_fn = build_generalized_loss_fn(cell, target_v_jnp, dt, transform, param_names)
- 
+
+    # --- Stiffness-aware LR scaling ---
+    # Extra channels beyond Na+K+Leak stiffen the ODE Jacobian.
+    # Scale LR down to keep the first optimizer step safe.
+    n_extra_channels = max(0, len(proposal.channels) - 3)  # beyond Na, K, Leak
+    stiffness_factor = 1.0 / (1.0 + 0.5 * n_extra_channels)  # Kv3 → 0.67×
+    lr_effective = lr * stiffness_factor
+    logger.info(f"  LR scaling: base={lr}, stiffness_factor={stiffness_factor:.2f} "
+                f"({n_extra_channels} extra channels), effective={lr_effective:.4f}")
+
+    # --- Adaptive gradient clip norm ---
+    # More parameters = gradient norm budget spread thinner per param.
+    # Scale clip norm down with sqrt(n_params) relative to 8-param baseline.
+    clip_norm = 5.0 * np.sqrt(8.0 / max(len(param_names), 1))
+    clip_norm = max(clip_norm, 1.0)  # floor at 1.0
+    logger.info(f"  Gradient clip norm: {clip_norm:.2f} (for {len(param_names)} params)")
+
     # --- Cosine LR schedule with linear warmup ---
-    warmup_epochs = min(20, epochs // 10)
+    warmup_epochs = min(30, epochs // 5)  # longer warmup for stability
     schedule = optax.join_schedules(
         schedules=[
-            optax.linear_schedule(init_value=lr * 0.1, end_value=lr,
+            optax.linear_schedule(init_value=lr_effective * 0.01,  # start at 1% (was 10%)
+                                  end_value=lr_effective,
                                   transition_steps=warmup_epochs),
-            optax.cosine_decay_schedule(init_value=lr,
+            optax.cosine_decay_schedule(init_value=lr_effective,
                                         decay_steps=epochs - warmup_epochs,
-                                        alpha=0.01),  # decays to 1% of peak LR
+                                        alpha=0.01),
         ],
         boundaries=[warmup_epochs],
     )
- 
+
     optimizer = optax.chain(
-        optax.clip_by_global_norm(5.0),   # tighter global norm clipping
+        optax.clip_by_global_norm(clip_norm),
         optax.adam(learning_rate=schedule),
     )
     opt_state = optimizer.init(opt_params)
- 
-    # JIT-compiled training step (no per-element clipping — handled by chain above)
+
+    # JIT-compiled training step with NaN-safe gradient handling.
+    # If any gradient component is NaN/inf, we replace the entire gradient
+    # tree with zeros. This means "skip this step" rather than propagating
+    # NaN through clip_by_global_norm (which would produce all-NaN updates
+    # because norm(NaN) = NaN → scale = NaN).
     @jit
     def step(params, opt_state):
         loss_val, grads = value_and_grad(loss_fn)(params)
-        updates, new_opt_state = optimizer.update(grads, opt_state, params)
+
+        # Check if any gradient leaf contains NaN/inf
+        grad_finite = jax.tree.reduce(
+            lambda a, b: a & b,
+            jax.tree.map(lambda g: jnp.all(jnp.isfinite(g)), grads),
+        )
+        # If gradient has NaN, zero it out (no-op step, preserves opt_state)
+        safe_grads = jax.tree.map(
+            lambda g: jnp.where(grad_finite, g, jnp.zeros_like(g)),
+            grads,
+        )
+
+        updates, new_opt_state = optimizer.update(safe_grads, opt_state, params)
         new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss_val
+        return new_params, new_opt_state, loss_val, grad_finite
  
     losses = []
     best_loss = float("inf")
     best_params = None
     nan_count = 0
-    max_nan = 5
-    patience = 50            # stop if no improvement for this many epochs
+    max_nan = 15              # increased: rollback+jitter gives more recovery chances
+    nan_grad_count = 0        # track NaN gradients separately
+    patience = 50
     epochs_since_best = 0
-    divergence_threshold = 3.0  # rollback if loss > best * this factor
- 
-    logger.info(f"  Starting optimisation: {epochs} epochs, lr={lr} (cosine schedule)")
- 
+    divergence_threshold = 3.0
+    jitter_scale = 0.01       # scale of random perturbation on rollback
+    rng = np.random.RandomState(42)
+
+    logger.info(f"  Starting optimisation: {epochs} epochs, lr={lr_effective:.4f} "
+                f"(cosine schedule, warmup={warmup_epochs})")
+
     for epoch in range(epochs):
         try:
-            opt_params, opt_state, loss_val = step(opt_params, opt_state)
+            opt_params, opt_state, loss_val, grad_ok = step(opt_params, opt_state)
             loss_float = float(loss_val)
+            grad_was_finite = bool(grad_ok)
         except Exception as e:
             logger.warning(f"  Epoch {epoch}: simulation error — {e}")
             nan_count += 1
             if nan_count >= max_nan:
                 logger.error(f"  {max_nan} consecutive failures, stopping")
                 break
-            # Rollback to best params on exception
+            # Rollback with jitter to escape the unstable basin
             if best_params is not None:
-                opt_params = jax.tree.map(lambda x: x.copy(), best_params)
+                opt_params = jax.tree.map(
+                    lambda x: x + jitter_scale * jax.numpy.array(
+                        rng.randn(*x.shape).astype(np.float32)),
+                    best_params,
+                )
                 opt_state = optimizer.init(opt_params)
+                logger.info(f"    Epoch {epoch}: rollback + jitter (scale={jitter_scale:.3f})")
             continue
- 
+
+        # Handle NaN loss
         if np.isnan(loss_float) or np.isinf(loss_float):
             nan_count += 1
             if nan_count >= max_nan:
                 logger.warning(f"  {max_nan} consecutive NaN/inf, stopping")
                 break
-            # Rollback to best params on NaN
             if best_params is not None:
-                opt_params = jax.tree.map(lambda x: x.copy(), best_params)
+                # Rollback with jitter to break the deterministic death spiral
+                opt_params = jax.tree.map(
+                    lambda x: x + jitter_scale * jax.numpy.array(
+                        rng.randn(*x.shape).astype(np.float32)),
+                    best_params,
+                )
                 opt_state = optimizer.init(opt_params)
+                logger.info(f"    Epoch {epoch}: NaN loss, rollback + jitter")
+            # Increase jitter progressively if NaN persists
+            if nan_count > 3:
+                jitter_scale = min(jitter_scale * 1.5, 0.1)
             continue
         else:
             nan_count = 0
- 
+            jitter_scale = 0.01  # reset jitter on successful step
+
+        # Track NaN gradients (step was no-op due to zeroed grads)
+        if not grad_was_finite:
+            nan_grad_count += 1
+            if nan_grad_count % 10 == 0:
+                logger.info(f"    Epoch {epoch}: NaN gradient (zeroed), "
+                            f"total={nan_grad_count}")
+            # Loss is finite but gradient isn't — the step was a no-op,
+            # so opt_state still advanced (Adam counters tick), which
+            # naturally changes the next step. No rollback needed.
+            continue
+
         losses.append(loss_float)
- 
+
         if loss_float < best_loss:
             best_loss = loss_float
             best_params = jax.tree.map(lambda x: x.copy(), opt_params)
             epochs_since_best = 0
         else:
             epochs_since_best += 1
- 
+
         # Rollback if loss has diverged significantly from best
         if (best_params is not None
             and best_loss > 0
@@ -856,14 +961,14 @@ def fit_proposal(
                         f"best={best_loss:.4f}, rolling back")
             opt_params = jax.tree.map(lambda x: x.copy(), best_params)
             opt_state = optimizer.init(opt_params)
-            epochs_since_best = 0  # reset patience after rollback
- 
+            epochs_since_best = 0
+
         # Patience-based early stopping
         if epochs_since_best >= patience and epoch > warmup_epochs + patience:
             logger.info(f"    Early stopping: no improvement for {patience} epochs "
                         f"(best={best_loss:.4f})")
             break
- 
+
         if epoch % 20 == 0 or epoch == epochs - 1:
             logger.info(f"    Epoch {epoch:4d}  loss={loss_float:.4f}  "
                         f"best={best_loss:.4f}")

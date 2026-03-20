@@ -321,18 +321,18 @@ The following are Jaxley's built-in defaults and the SAFE optimization range.
 Values outside the "safe upper" can cause gradient overflow (NaN).
  
 PARAMETER BOUNDS (all conductances in S/cm²):
-  Na_gNa:      {default: 0.05,   lower: 0.01,   upper: 0.20}
+  Na_gNa:      {default: 0.10,   lower: 0.01,   upper: 0.20}
   K_gK:        {default: 0.005,  lower: 0.001,  upper: 0.05}
   Leak_gLeak:  {default: 0.0001, lower: 1e-5,   upper: 0.002}
-  Leak_eLeak:  {default: -70.0,  lower: -80.0,  upper: -50.0}  (mV)
-  Kv3_gKv3:    {default: 0.003,  lower: 5e-4,   upper: 0.03}
+  Leak_eLeak:  {default: -70.0,  lower: -85.0,  upper: -50.0}  (mV)
+  Kv3_gKv3:    {default: 0.005,  lower: 5e-4,   upper: 0.03}
   IM_gM:       {default: 7e-5,   lower: 1e-6,   upper: 0.005}
   IAHP_gAHP:   {default: 1e-4,   lower: 1e-6,   upper: 0.005}
   IT_gT:       {default: 1e-4,   lower: 1e-6,   upper: 0.005}
   ICaL_gCaL:   {default: 1e-4,   lower: 1e-6,   upper: 0.005}
   IH_gH:       {default: 2e-5,   lower: 1e-6,   upper: 0.001}
-  eNa:         {default: 50.0,   lower: 40.0,   upper: 65.0}   (mV)
-  eK:          {default: -90.0,  lower: -100.0,  upper: -70.0}  (mV)
+  eNa:         {default: 55.0,   lower: 40.0,   upper: 70.0}   (mV)
+  eK:          {default: -90.0,  lower: -110.0,  upper: -70.0}  (mV)
   capacitance: {default: 1.0,    lower: 0.5,    upper: 2.0}    (µF/cm²)
   radius:      {default: 10.0,   lower: 3.0,    upper: 20.0}   (µm)
  
