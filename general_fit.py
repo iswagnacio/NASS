@@ -407,43 +407,43 @@ def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
                               n_windows=10, mse_weight=0.1,
                               stats_weight=5.0,
                               spike_count_weight=300.0,
+                              spike_timing_weight=100.0,
                               spike_threshold=-20.0):
     """
     Build a differentiable loss function combining:
       1. Waveform MSE (downweighted — refinement term)
       2. Windowed summary statistics (Deistler et al. 2025)
       3. Differentiable spike count penalty
+      4. Smoothed spike train distance (spike timing)
 
     LOSS HIERARCHY (by design):
-      spike_count >> windowed_stats >> MSE
+      spike_count >> spike_timing ≈ windowed_stats >> MSE
 
-    WHY MSE IS DOWNWEIGHTED:
-      Each misaligned spike creates ~(170 mV)² = 28,900 mV² of MSE at
-      that timestep. 56 spikes × ~40 timesteps each = 2,240 timesteps
-      of potential mismatch, adding ~487 to the mean MSE. This makes
-      "don't spike" the optimal MSE strategy. Evidence: across 12 SGA
-      iterations the optimizer consistently inflated radius/capacitance
-      to suppress spiking, achieving r=0.67 with 0 spikes rather than
-      r=0.45 with 9 spikes — because the MSE reward for not spiking
-      dominated both the spike count penalty and windowed stats.
+    SPIKE TIMING (Component 4):
+      A differentiable van Rossum-like distance. Both sim and target
+      voltage traces are converted to soft spike event trains via
+      sigmoid threshold crossings, then smoothed with a Gaussian kernel
+      (σ = 2 ms). MSE between the smoothed trains provides direct
+      gradient toward aligning individual spike times:
+        - If a sim spike is 3ms late, the Gaussians overlap partially,
+          and the gradient pushes parameters to shift the spike earlier.
+        - If a spike is missing, the unmatched target Gaussian creates
+          gradient toward producing a spike at that time.
+        - σ = 2 ms sets the timing tolerance: spikes within ~4ms are
+          considered well-aligned; beyond ~6ms they contribute fully.
 
-      With mse_weight=0.1, a 487-point MSE advantage from not spiking
-      becomes only ~49 points, easily overcome by spike_count_weight=300
-      (penalty of 300 for 0 spikes vs 0 for 56 spikes).
+      This complements the spike count term (which only cares about
+      total count, not where spikes occur) and the windowed stats
+      (which are too coarse at 115ms windows to resolve individual
+      spike positions).
 
     Args:
-        n_windows:          Number of temporal windows for summary stats.
-                            10 windows over 1150 ms ≈ 115 ms each, roughly
-                            2 ISIs at 56 spikes/1150 ms. Fine enough to
-                            detect per-window firing rate differences.
-        mse_weight:         Weight of raw MSE. Low (0.1) by design — MSE
-                            is a waveform refinement signal, not the primary
-                            driver. The Jaxley paper uses summary stats only.
-        stats_weight:       Weight of windowed stats (mean + std per window).
-        spike_count_weight: Weight of spike count loss. At 0/56 spikes,
-                            penalty = 300. At 9/56, penalty = 222.
-                            Clearly dominates MSE savings from not spiking.
-        spike_threshold:    Voltage threshold for spike detection (mV).
+        n_windows:           Number of temporal windows for summary stats.
+        mse_weight:          Weight of raw MSE (refinement signal).
+        stats_weight:        Weight of windowed stats (mean + std per window).
+        spike_count_weight:  Weight of spike count loss.
+        spike_timing_weight: Weight of smoothed spike train distance.
+        spike_threshold:     Voltage threshold for spike detection (mV).
     """
     # Pre-compute target summary statistics (non-differentiable, constants)
     target_np = np.array(target_v)
@@ -456,7 +456,8 @@ def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
 
     logger.info(f"  Loss function: target_spikes={int(target_spike_count)}, "
                 f"mse_weight={mse_weight}, stats_weight={stats_weight}, "
-                f"spike_count_weight={spike_count_weight}")
+                f"spike_count_weight={spike_count_weight}, "
+                f"spike_timing_weight={spike_timing_weight}")
 
     target_means = []
     target_stds = []
@@ -467,17 +468,37 @@ def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
         target_means.append(float(np.mean(window)))
         target_stds.append(float(np.std(window)))
 
-    # Convert to JAX arrays (constants in the loss)
     tgt_means = jnp.array(target_means)
     tgt_stds = jnp.array(target_stds)
 
-    # Normalisation factors (from Jaxley paper: divide means by 8, stds by 4)
     mean_scale = 8.0
     std_scale = 4.0
 
-    # Soft spike detection sharpness (mV^-1).
-    # k=0.5 gives a ~20 mV transition zone around threshold.
-    spike_k = 0.5
+    # --- Spike timing kernel setup ---
+    # Gaussian kernel: σ = 2 ms, truncated at ±3σ
+    spike_k = 0.5  # sigmoid sharpness for soft spike detection
+    sigma_ms = 2.0
+    sigma_steps = sigma_ms / dt
+    half_kernel = int(3.0 * sigma_steps)
+    kernel_x = jnp.arange(-half_kernel, half_kernel + 1, dtype=jnp.float32)
+    timing_kernel = jnp.exp(-kernel_x ** 2 / (2.0 * sigma_steps ** 2))
+    timing_kernel = timing_kernel / jnp.sum(timing_kernel)  # normalise to sum=1
+
+    logger.info(f"  Spike timing kernel: sigma={sigma_ms}ms ({sigma_steps:.0f} steps), "
+                f"kernel length={len(timing_kernel)}")
+
+    # Pre-compute smoothed target spike train (constant)
+    # Use the same soft detection as sim for consistent scale
+    tgt_p = 1.0 / (1.0 + np.exp(-spike_k * (target_np - spike_threshold)))
+    tgt_dp = np.diff(tgt_p)
+    tgt_events = np.maximum(tgt_dp, 0.0)  # upward crossings only
+    tgt_smoothed = jnp.array(
+        np.convolve(tgt_events, np.array(timing_kernel), mode='same'),
+        dtype=jnp.float32,
+    )
+    # Normalise so peak ~ 1.0, making the MSE scale interpretable
+    tgt_peak = float(np.max(tgt_smoothed)) if float(np.max(tgt_smoothed)) > 0 else 1.0
+    tgt_smoothed = tgt_smoothed / tgt_peak
 
     def loss_fn(opt_params):
         params = transform.forward(opt_params)
@@ -518,12 +539,24 @@ def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
             # --- Component 3: Differentiable spike count loss ---
             p = jax.nn.sigmoid(spike_k * (v_s - spike_threshold))
             dp = jnp.diff(p)
-            soft_count = jnp.sum(jax.nn.relu(dp))
+            soft_events = jax.nn.relu(dp)
+            soft_count = jnp.sum(soft_events)
             spike_loss = (soft_count / target_spike_count - 1.0) ** 2
+
+            # --- Component 4: Smoothed spike train distance (timing) ---
+            sim_smoothed = jnp.convolve(soft_events, timing_kernel, mode='same')
+            sim_smoothed = sim_smoothed / tgt_peak  # same normalisation as target
+
+            # MSE between smoothed spike trains
+            n_timing = min(len(sim_smoothed), len(tgt_smoothed))
+            timing_loss = jnp.mean(
+                (sim_smoothed[:n_timing] - tgt_smoothed[:n_timing]) ** 2
+            )
 
             total = (mse_weight * mse
                      + stats_weight * stats_loss
-                     + spike_count_weight * spike_loss)
+                     + spike_count_weight * spike_loss
+                     + spike_timing_weight * timing_loss)
 
         except Exception:
             total = jnp.array(float("inf"))

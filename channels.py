@@ -99,6 +99,7 @@ class Kv3(Channel):
         super().__init__(name)
         self.channel_params = {
             f"{self._name}_gKv3": 1e-3,   # S/cm² (default, will be optimized)
+            "eK": -90.0,                   # shared global K+ reversal (mV)
         }
         self.channel_states = {
             f"{self._name}_n": 0.0,
@@ -128,8 +129,7 @@ class Kv3(Channel):
     def compute_current(self, states, v, params):
         n = states[f"{self._name}_n"]
         g = params[f"{self._name}_gKv3"] * n ** 2
-        e_k = -85.0  # Kv3 reversal potential
-        return g * (v - e_k)
+        return g * (v - params["eK"])
  
     def init_state(self, v, params):
         n_inf = _sigmoid(v, -12.4, 6.8)
@@ -158,6 +158,7 @@ class IM(Channel):
         super().__init__(name)
         self.channel_params = {
             f"{self._name}_gM": 1e-5,     # S/cm² (typically very small)
+            "eK": -90.0,                   # shared global K+ reversal (mV)
         }
         self.channel_states = {
             f"{self._name}_p": 0.0,
@@ -180,8 +181,7 @@ class IM(Channel):
     def compute_current(self, states, v, params):
         p = states[f"{self._name}_p"]
         g = params[f"{self._name}_gM"] * p
-        e_k = -80.0
-        return g * (v - e_k)
+        return g * (v - params["eK"])
 
     def init_state(self, v, params):
         p_inf = _sigmoid(v, -35.0, 10.0)
@@ -214,6 +214,7 @@ class IAHP(Channel):
         super().__init__(name)
         self.channel_params = {
             f"{self._name}_gAHP": 1e-5,
+            "eK": -90.0,                   # shared global K+ reversal (mV)
         }
         self.channel_states = {
             f"{self._name}_q": 0.0,
@@ -234,8 +235,7 @@ class IAHP(Channel):
     def compute_current(self, states, v, params):
         q = states[f"{self._name}_q"]
         g = params[f"{self._name}_gAHP"] * q
-        e_k = -80.0
-        return g * (v - e_k)
+        return g * (v - params["eK"])
 
     def init_state(self, v, params):
         q_inf = _sigmoid(v, -20.0, 5.0)
