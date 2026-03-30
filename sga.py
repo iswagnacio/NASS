@@ -212,7 +212,7 @@ from the target recording — use them to make informed choices from iteration 1
 
 ## Available Channels
 
-BUILT-IN: Na (fast sodium), K (delayed rectifier), Leak (passive)
+BUILT-IN: Na (standard HH fast sodium), K (delayed rectifier), Leak (passive)
 CUSTOM: Kv3 (fast K+, FS cells), IM (M-type, adaptation), IAHP (AHP),
         IT (T-type Ca2+, bursting), ICaL (L-type Ca2+), IH (HCN, sag)
 

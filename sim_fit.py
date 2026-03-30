@@ -47,7 +47,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 import jaxley as jx
-from jaxley.channels import Na, K, Leak
+from jaxley.channels import Na, K, Leak  # Reverted to standard HH Na (NaCortical had stability issues)
 from jaxley.optimize.transforms import ParamTransform, SigmoidTransform
 
 from allensdk.core.cell_types_cache import CellTypesCache
@@ -191,7 +191,7 @@ def build_hh_cell(dt: float = 0.025) -> jx.Compartment:
     to reflect the high channel density of fast-spiking cells.
     """
     comp = jx.Compartment()
-    comp.insert(Na())
+    comp.insert(Na())  # Standard HH Na (NaCortical had numerical instability)
     comp.insert(K())
     comp.insert(Leak())
 

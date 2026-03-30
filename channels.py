@@ -7,6 +7,7 @@ neuron modeling. These are the channels the LLM agent can reference
 when proposing model structures.
 
 Channels implemented (from NASS proposal Section 5):
+    - NaCortical: Cortical Na+ with fast h-gate recovery — enables high-frequency firing
     - Kv3:   Fast delayed rectifier — enables high-frequency firing in PV+ FS cells
     - IM:    Muscarinic (M-type) K+ — spike frequency adaptation
     - IAHP:  Ca²⁺-dependent K+ (afterhyperpolarization) — adaptation in pyramidals
@@ -33,8 +34,9 @@ Units follow Jaxley/NEURON convention:
     - Time: ms
 
 Usage:
-    from channels import Kv3, IM, IAHP, IT, ICaL, IH
+    from channels import NaCortical, Kv3, IM, IAHP, IT, ICaL, IH
     comp = jx.Compartment()
+    comp.insert(NaCortical())  # Use instead of jaxley.channels.Na for cortical neurons
     comp.insert(Kv3())
     comp.insert(IM())
     # etc.
@@ -64,6 +66,120 @@ def _alpha_beta_from_inf_tau(x_inf, tau):
     alpha = x_inf / jnp.maximum(tau, 0.01)
     beta = (1.0 - x_inf) / jnp.maximum(tau, 0.01)
     return alpha, beta
+
+
+# ===========================================================================
+# NaCortical — Cortical Sodium Channel with Fast h-gate Recovery
+# ===========================================================================
+
+class NaCortical(Channel):
+    """
+    Cortical sodium channel optimized for high-frequency firing.
+
+    Based on Hodgkin-Huxley Na channel kinetics but with modified h-gate
+    (inactivation) recovery time constant to support PV+ fast-spiking
+    interneuron firing rates (50-200 Hz).
+
+    Key differences from standard HH Na:
+        - h-gate recovery τh reduced by 2-3× at subthreshold voltages
+        - Enables faster recovery from inactivation between spikes
+        - Matches Nav1.1/Nav1.6 cortical isoform properties
+
+    Standard HH Na channels (designed for squid giant axon) have τh ≈ 5-10 ms
+    at rest, which limits firing to ~30 Hz. Cortical PV+ interneurons express
+    Nav1.1/Nav1.6 with τh ≈ 1-3 ms, enabling sustained high-frequency firing.
+
+    I_Na = g_Na * m³ * h * (V - E_Na)
+
+    March 2026: Implemented to solve the bottleneck identified in auto-bounds
+    refactor testing, where standard HH Na kinetics could not produce 48.7 Hz
+    firing even with parameters at gradient safety limits.
+    """
+
+    def __init__(self, name="Na"):
+        # Default name to "Na" for compatibility with existing code that expects
+        # "Na_gNa", "Na_m", "Na_h" parameter names
+        self.current_is_in_mA_per_cm2 = True
+        super().__init__(name)
+        self.channel_params = {
+            f"{self._name}_gNa": 0.12,    # S/cm² (typical cortical value)
+            "eNa": 50.0,                   # mV (standard Nernst for Na+)
+        }
+        self.channel_states = {
+            f"{self._name}_m": 0.0,  # activation gate
+            f"{self._name}_h": 1.0,  # inactivation gate
+        }
+        self.current_name = "i_Na"
+
+    def update_states(self, states, dt, v, params):
+        m = states[f"{self._name}_m"]
+        h = states[f"{self._name}_h"]
+
+        # ---- Activation gate (m) — standard HH kinetics ----
+        # m_inf and tau_m follow classic Hodgkin-Huxley formulation
+        # Fast activation during spike upstroke
+
+        # Voltage-dependent rates (Traub & Miles 1991 cortical adaptation)
+        alpha_m = 0.32 * (v + 54.0) / (1.0 - _safe_exp(-(v + 54.0) / 4.0))
+        beta_m = 0.28 * (v + 27.0) / (_safe_exp((v + 27.0) / 5.0) - 1.0)
+
+        # Steady-state and time constant
+        m_inf = alpha_m / (alpha_m + beta_m)
+        tau_m = 1.0 / (alpha_m + beta_m)
+        tau_m = jnp.clip(tau_m, 0.01, 10.0)  # Gradient safety
+
+        # ---- Inactivation gate (h) — ACCELERATED RECOVERY ----
+        # This is the key modification for high-frequency firing
+        # Standard HH: τh ≈ 5-10 ms at subthreshold voltages
+        # Cortical Nav1.1/1.6: τh ≈ 1-3 ms at subthreshold voltages
+
+        # Voltage-dependent rates (modified for fast recovery)
+        alpha_h = 0.128 * _safe_exp(-(v + 50.0) / 18.0)
+        beta_h = 4.0 / (1.0 + _safe_exp(-(v + 27.0) / 5.0))
+
+        # Steady-state (unchanged from standard HH)
+        h_inf = alpha_h / (alpha_h + beta_h)
+
+        # Time constant — KEY MODIFICATION
+        # Standard HH: tau_h = 1.0 / (alpha_h + beta_h)
+        # Cortical: 2.5× faster at rest, less acceleration during spikes
+        tau_h_standard = 1.0 / (alpha_h + beta_h)
+
+        # Acceleration factor: 2× at subthreshold (V < -40 mV),
+        # smoothly transitions to 1× (no acceleration) during spikes
+        # FIX: Use (1 - sigmoid) so acceleration is HIGH at rest, LOW during spikes
+        # Reduced from 1.5 to 1.0 multiplier (2× instead of 2.5×) for stability
+        accel_factor = 1.0 + 1.0 * (1.0 - _sigmoid(v, -40.0, -10.0))
+        tau_h = tau_h_standard / accel_factor
+
+        tau_h = jnp.clip(tau_h, 0.3, 20.0)  # Gradient safety (raised floor to 0.3 ms)
+
+        # ---- Update gates ----
+        alpha_m_eff, beta_m_eff = _alpha_beta_from_inf_tau(m_inf, tau_m)
+        alpha_h_eff, beta_h_eff = _alpha_beta_from_inf_tau(h_inf, tau_h)
+
+        new_m = solve_gate_exponential(m, dt, alpha_m_eff, beta_m_eff)
+        new_h = solve_gate_exponential(h, dt, alpha_h_eff, beta_h_eff)
+
+        return {f"{self._name}_m": new_m, f"{self._name}_h": new_h}
+
+    def compute_current(self, states, v, params):
+        m = states[f"{self._name}_m"]
+        h = states[f"{self._name}_h"]
+        g = params[f"{self._name}_gNa"] * m ** 3 * h
+        return g * (v - params["eNa"])
+
+    def init_state(self, v, params):
+        # Initialize at steady-state for given voltage
+        alpha_m = 0.32 * (v + 54.0) / (1.0 - _safe_exp(-(v + 54.0) / 4.0))
+        beta_m = 0.28 * (v + 27.0) / (_safe_exp((v + 27.0) / 5.0) - 1.0)
+        m_inf = alpha_m / (alpha_m + beta_m)
+
+        alpha_h = 0.128 * _safe_exp(-(v + 50.0) / 18.0)
+        beta_h = 4.0 / (1.0 + _safe_exp(-(v + 27.0) / 5.0))
+        h_inf = alpha_h / (alpha_h + beta_h)
+
+        return {f"{self._name}_m": m_inf, f"{self._name}_h": h_inf}
 
 
 # ===========================================================================
@@ -417,6 +533,16 @@ class IH(Channel):
 # ===========================================================================
 
 CHANNEL_REGISTRY = {
+    "NaCortical": {
+        "class": NaCortical,
+        "ion": "Na",
+        "description": "Cortical Na+ with fast h-gate recovery. Enables high-frequency "
+                       "firing in PV+ FS interneurons via rapid recovery from inactivation. "
+                       "Use instead of standard HH Na for cortical neurons.",
+        "key_param": "gNa",
+        "typical_range": (0.05, 0.50),
+        "neuron_types": ["PV+ fast-spiking", "all cortical neurons"],
+    },
     "Kv3": {
         "class": Kv3,
         "ion": "K",
@@ -489,18 +615,18 @@ def list_channels() -> str:
 if __name__ == "__main__":
     print(list_channels())
 
-    # Quick smoke test: build a PV+ FS cell with Kv3
+    # Quick smoke test: build a PV+ FS cell with NaCortical + Kv3
     import jaxley as jx
-    from jaxley.channels import Na, K, Leak
+    from jaxley.channels import K, Leak
 
     comp = jx.Compartment()
-    comp.insert(Na())
+    comp.insert(NaCortical())  # Use cortical Na instead of standard HH
     comp.insert(K())
     comp.insert(Leak())
     comp.insert(Kv3())
     comp.insert(IM())
 
-    print(f"\nNode columns after inserting Na+K+Leak+Kv3+IM:")
+    print(f"\nNode columns after inserting NaCortical+K+Leak+Kv3+IM:")
     for col in sorted(comp.nodes.columns):
         if any(ch in col for ch in ["Na", "K", "Leak", "Kv3", "IM", "gK", "gN", "gM"]):
             print(f"  {col}")

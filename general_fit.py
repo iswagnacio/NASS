@@ -38,7 +38,7 @@ from jaxley.optimize.transforms import ParamTransform, SigmoidTransform
 
 from allensdk.core.cell_types_cache import CellTypesCache
 
-from channels import Kv3, IM, IAHP, IT, ICaL, IH, CHANNEL_REGISTRY
+from channels import NaCortical, Kv3, IM, IAHP, IT, ICaL, IH, CHANNEL_REGISTRY
 from sga import ModelProposal, DiagnosticReport
 from sim_fit import (
     load_training_sweep,
@@ -60,7 +60,10 @@ logger = logging.getLogger(__name__)
 # Channel Resolution
 # ===========================================================================
 
-BUILTIN_CHANNELS = {"Na": Na, "K": K, "Leak": Leak}
+# REVERTED: NaCortical caused numerical instability (NaN every 10 epochs, 0 spikes).
+# Going back to standard HH Na which achieved 44/56 spikes in pre-refactor testing.
+# NaCortical available as "NaCortical" if needed for future investigation.
+BUILTIN_CHANNELS = {"Na": Na, "NaCortical": NaCortical, "K": K, "Leak": Leak}
 CUSTOM_CHANNELS = {name: info["class"] for name, info in CHANNEL_REGISTRY.items()}
 ALL_CHANNELS = {**BUILTIN_CHANNELS, **CUSTOM_CHANNELS}
 
@@ -68,7 +71,7 @@ ALL_CHANNELS = {**BUILTIN_CHANNELS, **CUSTOM_CHANNELS}
 # These are conservative defaults — the LLM should override them with
 # informed choices based on the trace features it receives in its prompt.
 FALLBACK_PARAM_BOUNDS = {
-    "Na_gNa":    {"init": 0.10, "lower": 0.01,  "upper": 0.20},
+    "Na_gNa":    {"init": 0.10, "lower": 0.01,  "upper": 0.20},  # Reverted to standard HH
     "K_gK":      {"init": 0.005, "lower": 0.001, "upper": 0.05},
     "Leak_gLeak":{"init": 0.0001,"lower": 1e-5,  "upper": 0.002},
     "Leak_eLeak":{"init": -70.0, "lower": -85.0, "upper": -50.0},
