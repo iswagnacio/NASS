@@ -10,6 +10,8 @@ Architecture (after auto_bounds refactor):
     - LLM makes ALL biophysical decisions (bounds, inits, channels)
     - Inner loop only applies gradient safety clamping (NaN prevention)
     - FALLBACK_PARAM_BOUNDS used only when LLM omits a parameter
+    - Geometry bounds derived from LLM's proposal radius/capacitance (±25%/±30%)
+    - Phased loss training: Phase 1 (spike count only) → Phase 2 (+ timing)
 """
 
 import json
@@ -118,7 +120,17 @@ class DiagnosticReport:
     broad_spikes: bool = False
     parameters_at_bounds: list = field(default_factory=list)
 
-    def generate_feedback(self) -> str:
+    def generate_feedback(self, previous_best_spikes: int = 0,
+                          previous_best_eNa: float = None) -> str:
+        """
+        Generate diagnostic feedback for the LLM.
+
+        Args:
+            previous_best_spikes: spike count from the best previous proposal
+                                  (used to detect regression warnings)
+            previous_best_eNa: eNa value from the best previous proposal
+                               (used to detect eNa-widening regression)
+        """
         p = self.proposal
         lines = [
             f"## Inner Loop Results for Proposal #{p.proposal_id}",
@@ -158,6 +170,20 @@ class DiagnosticReport:
             lines.append(f"  {name}: fitted={fitted_val:.4f} in [{lower}, {upper}] ({source}){at_bound}")
 
         lines.append("\n## Diagnostic Issues:")
+
+        # ---- Regression warning: lost spikes after widening eNa ----
+        if (previous_best_spikes > 0
+                and self.n_sim_spikes == 0
+                and previous_best_eNa is not None):
+            current_eNa_upper = p.param_config.get("eNa", {}).get("upper", None)
+            if current_eNa_upper is not None and current_eNa_upper > previous_best_eNa + 5:
+                lines.append(
+                    f"- **⚠️ REGRESSION: LOST ALL SPIKES**: The previous best proposal "
+                    f"achieved {previous_best_spikes} spikes with eNa≤{previous_best_eNa:.0f} mV. "
+                    f"Your wider eNa (upper={current_eNa_upper:.0f} mV) caused regression to 0 spikes. "
+                    f"In single-compartment HH models, constrained eNa (≤90 mV) produces smaller, "
+                    f"faster spikes that avoid deep Na inactivation. REVERT eNa to ≤{previous_best_eNa:.0f} mV "
+                    f"and focus on other parameters (conductances, Kv3 balance, capacitance).")
 
         if self.no_spikes:
             lines.append(
@@ -224,18 +250,50 @@ Na, K, and Leak are always auto-inserted.
    and every gradient is NaN. This is a Jaxley single-compartment requirement
    (real neurons have concentrated Na at the AIS; one compartment needs more).
 
-2. eNa must be 30-90 mV ABOVE the spike peak. The spike peak is set by
-   Na inactivation + K competition, NOT by proximity to eNa. Typical: 50-115 mV.
+2. **eNa PARADOX (CRITICAL)**: In single-compartment HH models, LOWER eNa often
+   produces MORE spikes. This is counterintuitive but well-documented:
+   - With eNa ≤ 90 mV: each spike is smaller and faster, Na inactivation (h-gate)
+     recovers quickly, enabling sustained high-frequency firing.
+   - With eNa > 100 mV: each spike is tall and slow, causing DEEP Na inactivation
+     from which the h-gate cannot recover fast enough for the next spike.
+   - The standard HH h-gate has τh ≈ 5-10 ms at rest — too slow for >30 Hz
+     firing unless spikes are kept small by constraining eNa.
+   - **RULE: If a previous proposal achieved >10 spikes with eNa ≤ 90 mV,
+     DO NOT widen eNa beyond 90 mV.** Instead, improve other parameters.
+   - If eNa hits its upper bound, the correct response is usually to increase
+     Na_gNa, reduce Kv3_gKv3, or decrease radius — NOT to raise eNa further.
 
 3. eK must be below the AHP trough. Typical: -120 to -70 mV.
 
 4. Radius controls current density: smaller radius → higher current density →
    easier to spike. For fast-spiking cells, prefer 5-12 µm. The optimizer WILL
    inflate radius to suppress spiking if allowed — cap the upper bound.
+   NOTE: The system constrains radius to ±25% of your proposed value. If you
+   propose radius=8, the optimizer can adjust within [6, 10] µm.
 
 5. Capacitance > 2.0 µF/cm² slows dynamics and reduces firing rate.
 
 6. All conductances are in S/cm² (NOT mS/cm²). Classic HH Na = 0.12 S/cm².
+
+## What To Do When Spikes Are Too Few (But >0)
+
+When a model produces SOME spikes but not enough, the issue is NOT eNa being
+too low. The issue is the Na/K balance and geometry. Try these IN ORDER:
+  1. Decrease radius (concentrates current density)
+  2. Decrease capacitance (speeds up membrane dynamics)
+  3. Increase Na_gNa init and upper bound (more Na current)
+  4. Decrease Kv3_gKv3 init (less spike suppression from fast K+)
+  5. Adjust eK closer to AHP trough (less repolarizing drive)
+Do NOT widen eNa beyond what previously produced spikes.
+
+## What To Do When Model Produces 0 Spikes
+
+If the model has 0 spikes with eNa already at 115 mV, the problem is
+NOT that eNa is too low. Check:
+  1. Is radius too large? (>12 µm dilutes current density)
+  2. Is Na_gNa too low? (needs ≥0.10, ideally 0.15-0.35 for FS cells)
+  3. Is the previous best proposal's eNa much lower? If so, REVERT to it.
+  4. Are conductance ratios wrong? (Na should dominate over K+Kv3 combined)
 
 ## Gradient Safety Limits (the ONLY programmatic override)
 
@@ -248,7 +306,7 @@ should stay within these, but if you exceed them, they'll be silently clamped:
   eNa:             [30, 115] mV
   eK:              [-120, -55] mV
   capacitance:     [0.2, 3.0] µF/cm²
-  radius:          [1.5, 30] µm
+  radius:          [1.5, 30] µm (but system constrains to ±25% of your proposal)
 
 ## Response Format
 
@@ -268,6 +326,11 @@ should stay within these, but if you exceed them, they'll be silently clamped:
 Include param_config for ALL parameters you have an opinion about.
 Parameters you omit use conservative fallback defaults (which may be suboptimal).
 The more parameters you specify, the better the fit will be.
+
+IMPORTANT: Do NOT include "radius" or "capacitance" in param_config unless you
+want to override the geometry-derived bounds. Your top-level "radius" and
+"capacitance" fields set the init; the system derives bounds as ±25% for radius
+and ±30% for capacitance.
 """
 
 
@@ -288,20 +351,67 @@ Based on this neuron's properties AND the measured trace features above,
 propose an initial set of ion channels and COMPLETE parameter configurations.
 
 You MUST include param_config entries for at least: Na_gNa, K_gK, Leak_gLeak,
-Leak_eLeak, eNa, eK, capacitance, and radius. Use the trace features to set
-appropriate bounds (e.g., eNa must exceed spike peak, eK must be below AHP trough).
+Leak_eLeak, eNa, eK. Use the trace features to set appropriate bounds
+(e.g., eNa should be 30-70 mV above spike peak but NOT above 90 mV for
+fast-spiking cells; eK must be below AHP trough).
+
+Set radius and capacitance as top-level fields (NOT in param_config).
+For fast-spiking cells, use radius=6-10 µm and capacitance=1.0-1.5 µF/cm².
 
 Respond with a JSON object as specified in your instructions."""
 
 
 def make_revision_prompt(diagnostic, heap_summary: str,
-                         trace_features_text: str = "") -> str:
-    """Build the revision prompt with trace features."""
-    feedback = diagnostic.generate_feedback()
+                         trace_features_text: str = "",
+                         best_proposal: ModelProposal = None) -> str:
+    """
+    Build the revision prompt with trace features and regression context.
+
+    Args:
+        diagnostic: DiagnosticReport from the last iteration
+        heap_summary: text summary of the top-k heap
+        trace_features_text: formatted trace features
+        best_proposal: the current best proposal in the heap (for regression detection)
+    """
+    # Compute regression context
+    previous_best_spikes = 0
+    previous_best_eNa = None
+    if best_proposal is not None:
+        bd = best_proposal.diagnostics
+        if isinstance(bd, dict):
+            previous_best_spikes = bd.get("n_sim_spikes", 0)
+        if best_proposal.fitted_params:
+            previous_best_eNa = best_proposal.fitted_params.get("eNa", None)
+        elif best_proposal.param_config and "eNa" in best_proposal.param_config:
+            previous_best_eNa = best_proposal.param_config["eNa"].get("upper", None)
+
+    feedback = diagnostic.generate_feedback(
+        previous_best_spikes=previous_best_spikes,
+        previous_best_eNa=previous_best_eNa)
+
+    # Build context about what has worked
+    context_lines = []
+    if best_proposal is not None and previous_best_spikes > 0:
+        bp = best_proposal
+        context_lines.append(f"\n## What Has Worked So Far")
+        context_lines.append(f"The best proposal so far achieved {previous_best_spikes} spikes "
+                             f"with loss={bp.loss:.2f}.")
+        if bp.fitted_params:
+            key_params = {k: v for k, v in bp.fitted_params.items()
+                          if k in ("eNa", "eK", "Na_gNa", "radius", "capacitance", "Kv3_gKv3")}
+            context_lines.append(f"Key fitted parameters: {json.dumps({k: round(v, 3) for k, v in key_params.items()})}")
+        if bp.param_config and "eNa" in bp.param_config:
+            context_lines.append(f"eNa bounds used: [{bp.param_config['eNa'].get('lower')}, "
+                                 f"{bp.param_config['eNa'].get('upper')}] mV")
+        context_lines.append(f"**Your revision should PRESERVE what worked and IMPROVE on it.**")
+        context_lines.append(f"**Do NOT widen eNa if the best proposal already had spikes with constrained eNa.**")
+    context_text = "\n".join(context_lines)
 
     return f"""## Task: Revise the model structure based on fitting results
 
 {feedback}
+
+{context_text}
 
 {trace_features_text}
 
@@ -310,9 +420,12 @@ def make_revision_prompt(diagnostic, heap_summary: str,
 
 Based on the diagnostic feedback AND the trace features above, propose a
 REVISED model structure. Priority:
-1. Fix any "parameters at bounds" by widening those bounds in param_config
-2. Address structural issues (missing channels, wrong types)
-3. Fine-tune initial values and geometry
+1. **PRESERVE what worked**: If a previous proposal achieved spikes, keep its
+   eNa bounds and geometry — do not widen eNa or inflate radius.
+2. Fix underfiring by adjusting Na_gNa, Kv3_gKv3, capacitance, or radius
+   (make radius SMALLER, not larger).
+3. Address any remaining structural issues (missing channels, wrong types).
+4. Fine-tune initial values.
 
 Respond with a JSON object as specified in your instructions."""
 
@@ -465,8 +578,10 @@ class OuterLoop:
                                             self.trace_features_text)
                 parent_id = None
             else:
-                prompt = make_revision_prompt(last_diagnostic, self.heap.summary(),
-                                             self.trace_features_text)
+                prompt = make_revision_prompt(
+                    last_diagnostic, self.heap.summary(),
+                    self.trace_features_text,
+                    best_proposal=self.heap.best())
                 parent_id = last_diagnostic.proposal.proposal_id
 
             logger.info("  Calling LLM for proposal...")

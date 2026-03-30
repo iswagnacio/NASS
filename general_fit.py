@@ -11,9 +11,15 @@ Bound architecture:
     1. LLM proposes param_config (biophysical judgment — informed by trace features)
     2. FALLBACK_PARAM_BOUNDS used for any parameter the LLM omits
     3. Gradient safety clamping (from auto_bounds) prevents NaN — the ONLY override
+    4. Geometry bounds derived from LLM's proposal radius/capacitance (±25%/±30%)
 
 The LLM sees trace features in its prompt and makes all biophysical decisions.
 This module does NOT second-guess the LLM's choices — it only prevents NaN.
+
+Training uses phased loss:
+    Phase 1 (epochs 0 to phase_switch): spike_count + stats + MSE only (no timing)
+    Phase 2 (epochs phase_switch to end): full loss with spike_timing added
+    This prevents the optimizer from suppressing spiking to avoid timing penalties.
 """
 
 # ---- JAX config must come before any JAX imports ----
@@ -84,7 +90,7 @@ FALLBACK_PARAM_BOUNDS = {
     "eNa":       {"init": 55.0,  "lower": 40.0,  "upper": 70.0},
     "eK":        {"init": -90.0, "lower": -110.0, "upper": -70.0},
     "capacitance":{"init": 1.0,  "lower": 0.5,   "upper": 2.0},
-    "radius":    {"init": 10.0,  "lower": 3.0,   "upper": 20.0},
+    "radius":    {"init": 10.0,  "lower": 3.0,   "upper": 12.0},
 }
 
 # Backwards-compatible alias
@@ -131,7 +137,7 @@ def _clamp_param_bounds(name: str, cfg: dict,
         "IT_gT": 0.01, "ICaL_gCaL": 0.01, "IH_gH": 0.005,
     }
     _STATIC_FLOORS = {"eNa": 30.0, "eK": -120.0, "capacitance": 0.2, "radius": 1.5}
-    _STATIC_GLOBALS = {"eNa": 115.0, "eK": -55.0, "capacitance": 3.0, "radius": 30.0}
+    _STATIC_GLOBALS = {"eNa": 115.0, "eK": -55.0, "capacitance": 3.0, "radius": 20.0}
 
     if name in _STATIC_CEILINGS and cfg.get("upper", 0) > _STATIC_CEILINGS[name]:
         cfg["upper"] = _STATIC_CEILINGS[name]
@@ -154,6 +160,51 @@ def _ensure_init_margin(init_val, lower, upper, margin_frac=0.05):
 
 
 # ===========================================================================
+# Geometry Bounds from LLM Proposal
+# ===========================================================================
+
+def _geometry_bounds_from_proposal(proposal: ModelProposal) -> dict:
+    """
+    Derive radius/capacitance bounds from the LLM's proposal geometry.
+
+    The LLM proposes explicit geometry values (radius, capacitance).
+    We use them as init and constrain the optimizer to ±25% for radius
+    and ±30% for capacitance. This prevents the optimizer from inflating
+    radius to suppress spiking (the radius-inflation exploit), while
+    still letting it fine-tune geometry within a reasonable range.
+
+    Radius is tighter (±25%) because the optimizer strongly exploits
+    radius inflation to dilute current density and avoid spiking.
+    Capacitance is slightly looser (±30%) as it's less exploitable.
+
+    This is NOT hardcoding — each neuron type gets different geometry via
+    the LLM's per-cell proposal. PV+ FS cells get small radii (~8 µm),
+    pyramidals get larger (~15 µm), etc.
+
+    Returns dict of {param_name: {init, lower, upper}} overrides.
+    """
+    overrides = {}
+
+    if hasattr(proposal, 'radius') and proposal.radius is not None:
+        r = float(proposal.radius)
+        overrides["radius"] = {
+            "init": r,
+            "lower": max(r * 0.75, 1.5),   # at least 1.5 µm
+            "upper": r * 1.25,
+        }
+
+    if hasattr(proposal, 'capacitance') and proposal.capacitance is not None:
+        c = float(proposal.capacitance)
+        overrides["capacitance"] = {
+            "init": c,
+            "lower": max(c * 0.7, 0.2),
+            "upper": c * 1.3,
+        }
+
+    return overrides
+
+
+# ===========================================================================
 # Build Cell from Proposal
 # ===========================================================================
 
@@ -164,7 +215,8 @@ def build_cell_from_proposal(proposal: ModelProposal,
 
     The LLM's param_config is used directly — only gradient safety
     clamping is applied. For parameters the LLM omits, FALLBACK_PARAM_BOUNDS
-    provides defaults.
+    provides defaults. Geometry bounds are derived from the proposal's
+    radius/capacitance fields (±25%/±30%).
 
     Args:
         proposal:         ModelProposal from the LLM
@@ -218,6 +270,7 @@ def build_cell_from_proposal(proposal: ModelProposal,
 
     # Collect trainable parameters
     trainable = []
+    geometry_overrides = _geometry_bounds_from_proposal(proposal)
 
     for ch_name in channels:
         for param_name in CHANNEL_CONDUCTANCE_PARAMS.get(ch_name, []):
@@ -231,8 +284,12 @@ def build_cell_from_proposal(proposal: ModelProposal,
             trainable.append({"name": param_name, "lower": cfg["lower"], "upper": cfg["upper"]})
 
     for param_name in GLOBAL_TRAINABLE:
+        # Priority: param_config > geometry_overrides > fallback
         if param_name in proposal.param_config:
             cfg = _clamp_param_bounds(param_name, proposal.param_config[param_name],
+                                      adaptive_limits)
+        elif param_name in geometry_overrides:
+            cfg = _clamp_param_bounds(param_name, geometry_overrides[param_name],
                                       adaptive_limits)
         elif param_name in FALLBACK_PARAM_BOUNDS:
             cfg = FALLBACK_PARAM_BOUNDS[param_name]
@@ -244,17 +301,16 @@ def build_cell_from_proposal(proposal: ModelProposal,
 
 
 # ===========================================================================
-# Build Loss Function
+# Build Loss Functions (Phased)
 # ===========================================================================
 
-def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
-                              n_windows=10, mse_weight=0.1,
-                              stats_weight=5.0,
-                              spike_count_weight=300.0,
-                              spike_timing_weight=100.0,
-                              spike_threshold=-20.0):
+def _build_shared_loss_components(target_v, dt, n_windows=10,
+                                   spike_threshold=-20.0):
     """
-    Differentiable loss: spike_count >> spike_timing ≈ windowed_stats >> MSE.
+    Pre-compute all target-derived quantities shared by Phase 1 and Phase 2
+    loss functions. Avoids duplicating expensive target preprocessing.
+
+    Returns a dict of JAX arrays and scalars.
     """
     target_np = np.array(target_v)
     n_total = len(target_np)
@@ -262,11 +318,6 @@ def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
 
     tgt_crossings = np.diff((target_np > spike_threshold).astype(int)) > 0
     target_spike_count = max(float(np.sum(tgt_crossings)), 1.0)
-
-    logger.info(f"  Loss function: target_spikes={int(target_spike_count)}, "
-                f"mse_weight={mse_weight}, stats_weight={stats_weight}, "
-                f"spike_count_weight={spike_count_weight}, "
-                f"spike_timing_weight={spike_timing_weight}")
 
     target_means, target_stds = [], []
     for w in range(n_windows):
@@ -276,10 +327,6 @@ def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
         target_means.append(float(np.mean(window)))
         target_stds.append(float(np.std(window)))
 
-    tgt_means = jnp.array(target_means)
-    tgt_stds = jnp.array(target_stds)
-    mean_scale, std_scale = 8.0, 4.0
-
     spike_k = 0.5
     sigma_ms = 2.0
     sigma_steps = sigma_ms / dt
@@ -288,15 +335,116 @@ def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
     timing_kernel = jnp.exp(-kernel_x ** 2 / (2.0 * sigma_steps ** 2))
     timing_kernel = timing_kernel / jnp.sum(timing_kernel)
 
-    logger.info(f"  Spike timing kernel: sigma={sigma_ms}ms ({sigma_steps:.0f} steps), "
-                f"kernel length={len(timing_kernel)}")
-
     tgt_p = 1.0 / (1.0 + np.exp(-spike_k * (target_np - spike_threshold)))
     tgt_dp = np.diff(tgt_p)
     tgt_events = np.maximum(tgt_dp, 0.0)
-    tgt_smoothed = jnp.array(np.convolve(tgt_events, np.array(timing_kernel), mode='same'), dtype=jnp.float32)
-    tgt_peak = float(np.max(tgt_smoothed)) if float(np.max(tgt_smoothed)) > 0 else 1.0
-    tgt_smoothed = tgt_smoothed / tgt_peak
+    tgt_smoothed_np = np.convolve(tgt_events, np.array(timing_kernel), mode='same')
+    tgt_peak = float(np.max(tgt_smoothed_np)) if float(np.max(tgt_smoothed_np)) > 0 else 1.0
+    tgt_smoothed = jnp.array(tgt_smoothed_np / tgt_peak, dtype=jnp.float32)
+
+    return {
+        "n_total": n_total,
+        "n_windows": n_windows,
+        "win_size": win_size,
+        "target_spike_count": target_spike_count,
+        "tgt_means": jnp.array(target_means),
+        "tgt_stds": jnp.array(target_stds),
+        "mean_scale": 8.0,
+        "std_scale": 4.0,
+        "spike_k": spike_k,
+        "spike_threshold": spike_threshold,
+        "timing_kernel": timing_kernel,
+        "tgt_smoothed": tgt_smoothed,
+        "tgt_peak": tgt_peak,
+        "sigma_ms": sigma_ms,
+        "sigma_steps": sigma_steps,
+    }
+
+
+def _build_phase1_loss_fn(cell, target_v, dt, transform, param_names,
+                           shared, mse_weight=0.1, stats_weight=5.0,
+                           spike_count_weight=300.0):
+    """
+    Phase 1 loss: spike_count + windowed_stats + MSE.
+    NO spike timing penalty.
+
+    This lets the optimizer find spiking solutions without being penalized
+    for spike misalignment. Once spiking is established, Phase 2 adds
+    timing to refine spike positions.
+    """
+    n_windows = shared["n_windows"]
+    win_size = shared["win_size"]
+    target_spike_count = shared["target_spike_count"]
+    tgt_means = shared["tgt_means"]
+    tgt_stds = shared["tgt_stds"]
+    mean_scale = shared["mean_scale"]
+    std_scale = shared["std_scale"]
+    spike_k = shared["spike_k"]
+    spike_threshold = shared["spike_threshold"]
+
+    def loss_fn(opt_params):
+        params = transform.forward(opt_params)
+        param_state = None
+        for i, name in enumerate(param_names):
+            param_state = cell.data_set(name, params[i][name], param_state)
+
+        try:
+            v = jx.integrate(cell, param_state=param_state, delta_t=dt)
+            v_sim = v[0]
+            n = min(len(v_sim), len(target_v))
+            v_s, v_t = v_sim[:n], target_v[:n]
+
+            mse = jnp.mean((v_s - v_t) ** 2)
+
+            sim_means, sim_stds = [], []
+            for w in range(n_windows):
+                start = w * win_size
+                end = start + win_size if w < n_windows - 1 else n
+                win = v_s[start:end]
+                sim_means.append(jnp.mean(win))
+                sim_stds.append(jnp.std(win))
+            sim_means = jnp.stack(sim_means)
+            sim_stds = jnp.stack(sim_stds)
+            stats_loss = (jnp.mean(jnp.abs(sim_means / mean_scale - tgt_means / mean_scale))
+                         + jnp.mean(jnp.abs(sim_stds / std_scale - tgt_stds / std_scale)))
+
+            p = jax.nn.sigmoid(spike_k * (v_s - spike_threshold))
+            dp = jnp.diff(p)
+            soft_events = jax.nn.relu(dp)
+            soft_count = jnp.sum(soft_events)
+            spike_loss = (soft_count / target_spike_count - 1.0) ** 2
+
+            # NO timing_loss in Phase 1
+            total = (mse_weight * mse + stats_weight * stats_loss
+                     + spike_count_weight * spike_loss)
+        except Exception:
+            total = jnp.array(float("inf"))
+        return total
+
+    return loss_fn
+
+
+def _build_phase2_loss_fn(cell, target_v, dt, transform, param_names,
+                           shared, mse_weight=0.1, stats_weight=5.0,
+                           spike_count_weight=300.0,
+                           spike_timing_weight=100.0):
+    """
+    Phase 2 (full) loss: spike_count + spike_timing + windowed_stats + MSE.
+
+    All four components active. Used after Phase 1 has established spiking.
+    """
+    n_windows = shared["n_windows"]
+    win_size = shared["win_size"]
+    target_spike_count = shared["target_spike_count"]
+    tgt_means = shared["tgt_means"]
+    tgt_stds = shared["tgt_stds"]
+    mean_scale = shared["mean_scale"]
+    std_scale = shared["std_scale"]
+    spike_k = shared["spike_k"]
+    spike_threshold = shared["spike_threshold"]
+    timing_kernel = shared["timing_kernel"]
+    tgt_smoothed = shared["tgt_smoothed"]
+    tgt_peak = shared["tgt_peak"]
 
     def loss_fn(opt_params):
         params = transform.forward(opt_params)
@@ -341,6 +489,25 @@ def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
         return total
 
     return loss_fn
+
+
+def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
+                              n_windows=10, mse_weight=0.1,
+                              stats_weight=5.0,
+                              spike_count_weight=300.0,
+                              spike_timing_weight=100.0,
+                              spike_threshold=-20.0):
+    """
+    Backward-compatible wrapper: builds full (Phase 2) loss function.
+
+    Code that calls build_generalized_loss_fn directly (e.g. sim_fit.py)
+    gets the same behavior as before. The phased training only applies
+    inside fit_proposal.
+    """
+    shared = _build_shared_loss_components(target_v, dt, n_windows, spike_threshold)
+    return _build_phase2_loss_fn(cell, target_v, dt, transform, param_names,
+                                 shared, mse_weight, stats_weight,
+                                 spike_count_weight, spike_timing_weight)
 
 
 # ===========================================================================
@@ -479,17 +646,29 @@ def fit_proposal(
     epochs: int = 300,
     lr: float = 0.02,
     max_duration_ms: float = 1200.0,
+    phase_fraction: float = 0.5,
 ) -> DiagnosticReport:
     """
     Fit an agent-proposed model to a neuron's recordings.
+
+    Uses phased loss training:
+        Phase 1 (epochs 0 to phase_switch):
+            spike_count + stats + MSE only. No timing penalty.
+            Goal: find parameters that produce spikes.
+        Phase 2 (epochs phase_switch to end):
+            Full loss with spike_timing added.
+            Goal: align spike timing to target.
+
+    The phase_switch epoch is epochs * phase_fraction (default 0.5 = halfway).
 
     Steps:
         1. Load training data
         2. Extract baseline & window to stimulus
         3. Compute gradient safety limits from trace
-        4. Build cell (LLM's param_config + gradient safety only)
-        5. Run gradient descent
-        6. Return DiagnosticReport
+        4. Build cell (LLM's param_config + geometry bounds + gradient safety)
+        5. Build phased loss functions
+        6. Run gradient descent with phase switching
+        7. Return DiagnosticReport
     """
     data_dir = Path(data_dir)
     logger.info(f"  fit_proposal: channels={proposal.channels}, "
@@ -527,7 +706,7 @@ def fit_proposal(
         logger.warning(f"  Feature extraction failed ({e}), using static safety limits")
         adaptive_limits = None
 
-    # Step 4: Build cell — LLM's param_config used directly, only gradient safety applied
+    # Step 4: Build cell — LLM's param_config + geometry bounds + gradient safety
     cell, trainable, error = build_cell_from_proposal(proposal, adaptive_limits=adaptive_limits)
     if error:
         logger.error(f"  Cell construction failed: {error}")
@@ -561,11 +740,34 @@ def fit_proposal(
         return DiagnosticReport(proposal=proposal, specimen_id=specimen_id,
                                 final_loss=float("inf"), no_spikes=True)
 
-    # Step 6: Build loss and run gradient descent
+    # Step 6: Build phased loss functions
     param_names = [t["name"] for t in trainable]
     logger.info(f"  Trainable parameters ({len(param_names)}): {param_names}")
-    loss_fn = build_generalized_loss_fn(cell, target_v_jnp, dt, transform, param_names)
 
+    phase_switch = int(epochs * phase_fraction)
+    logger.info(f"  Phased training: Phase 1 epochs [0, {phase_switch}), "
+                f"Phase 2 epochs [{phase_switch}, {epochs})")
+
+    shared = _build_shared_loss_components(target_v_jnp, dt)
+
+    logger.info(f"  Loss function: target_spikes={int(shared['target_spike_count'])}, "
+                f"mse_weight=0.1, stats_weight=5.0, "
+                f"spike_count_weight=300.0, spike_timing_weight=100.0")
+    logger.info(f"  Spike timing kernel: sigma={shared['sigma_ms']}ms "
+                f"({shared['sigma_steps']:.0f} steps), "
+                f"kernel length={len(shared['timing_kernel'])}")
+
+    loss_fn_p1 = _build_phase1_loss_fn(cell, target_v_jnp, dt, transform,
+                                        param_names, shared)
+    loss_fn_p2 = _build_phase2_loss_fn(cell, target_v_jnp, dt, transform,
+                                        param_names, shared)
+
+    logger.info(f"  Phase 1 loss: spike_count=300, stats=5, MSE=0.1, "
+                f"spike_timing=0 (disabled)")
+    logger.info(f"  Phase 2 loss: spike_count=300, spike_timing=100, "
+                f"stats=5, MSE=0.1")
+
+    # Step 7: Set up optimizer
     n_extra_channels = max(0, len(proposal.channels) - 3)
     stiffness_factor = 1.0 / (1.0 + 0.5 * n_extra_channels)
     lr_effective = lr * stiffness_factor
@@ -591,9 +793,10 @@ def fit_proposal(
     optimizer = optax.chain(optax.clip_by_global_norm(clip_norm), optax.adam(learning_rate=schedule))
     opt_state = optimizer.init(opt_params)
 
+    # Step 8: JIT-compiled training steps for BOTH phases
     @jit
-    def step(params, opt_state):
-        loss_val, grads = value_and_grad(loss_fn)(params)
+    def step_phase1(params, opt_state):
+        loss_val, grads = value_and_grad(loss_fn_p1)(params)
         grad_finite = jax.tree.reduce(
             lambda a, b: a & b,
             jax.tree.map(lambda g: jnp.all(jnp.isfinite(g)), grads),
@@ -604,6 +807,20 @@ def fit_proposal(
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, loss_val, grad_finite
 
+    @jit
+    def step_phase2(params, opt_state):
+        loss_val, grads = value_and_grad(loss_fn_p2)(params)
+        grad_finite = jax.tree.reduce(
+            lambda a, b: a & b,
+            jax.tree.map(lambda g: jnp.all(jnp.isfinite(g)), grads),
+        )
+        safe_grads = jax.tree.map(
+            lambda g: jnp.where(grad_finite, g, jnp.zeros_like(g)), grads)
+        updates, new_opt_state = optimizer.update(safe_grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, loss_val, grad_finite
+
+    # Step 9: Training loop with phase switching
     losses = []
     best_loss, best_params = float("inf"), None
     nan_count, max_nan, nan_grad_count = 0, 15, 0
@@ -611,13 +828,28 @@ def fit_proposal(
     divergence_threshold = 3.0
     jitter_scale = 0.01
     rng = np.random.RandomState(42)
+    current_phase = 1
 
     logger.info(f"  Starting optimisation: {epochs} epochs, lr={lr_effective:.4f} "
                 f"(cosine schedule, warmup={warmup_epochs})")
 
     for epoch in range(epochs):
+        # ---- Phase switching ----
+        if epoch == phase_switch and current_phase == 1:
+            current_phase = 2
+            logger.info(f"  === PHASE SWITCH at epoch {epoch}: "
+                        f"adding spike_timing_weight=100.0 ===")
+            # Reset best-loss tracking since the loss function changed.
+            # Phase 2 loss includes timing so absolute values will be higher.
+            # Keep best_params as the starting point — don't lose Phase 1 progress.
+            best_loss = float("inf")
+            epochs_since_best = 0
+
+        # ---- Select step function for current phase ----
+        step_fn = step_phase1 if current_phase == 1 else step_phase2
+
         try:
-            opt_params, opt_state, loss_val, grad_ok = step(opt_params, opt_state)
+            opt_params, opt_state, loss_val, grad_ok = step_fn(opt_params, opt_state)
             loss_float = float(loss_val)
             grad_was_finite = bool(grad_ok)
         except Exception:
@@ -668,9 +900,10 @@ def fit_proposal(
             break
 
         if epoch % 20 == 0 or epoch == epochs - 1:
-            logger.info(f"    Epoch {epoch:4d}  loss={loss_float:.4f}  best={best_loss:.4f}")
+            phase_tag = f"[P{current_phase}]"
+            logger.info(f"    Epoch {epoch:4d}  loss={loss_float:.4f}  best={best_loss:.4f}  {phase_tag}")
 
-    # Step 7: Extract fitted parameters
+    # Step 10: Extract fitted parameters
     if best_params is None:
         logger.error("  No valid parameters found during optimisation")
         return DiagnosticReport(proposal=proposal, specimen_id=specimen_id,
@@ -696,7 +929,7 @@ def fit_proposal(
         return DiagnosticReport(proposal=proposal, specimen_id=specimen_id,
                                 final_loss=best_loss, no_spikes=True)
 
-    # Step 8: Diagnostics
+    # Step 11: Diagnostics
     target_np = np.array(target_v_jnp)
     diag = compute_diagnostics(v_sim, target_np, dt, proposal, fitted_dict, trainable, best_loss)
 
@@ -727,6 +960,8 @@ if __name__ == "__main__":
     parser.add_argument("--specimen-id", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=300)
     parser.add_argument("--channels", nargs="+", default=["Na", "K", "Leak", "Kv3"])
+    parser.add_argument("--phase-fraction", type=float, default=0.5,
+                        help="Fraction of epochs for Phase 1 (no timing loss). Default 0.5")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -741,5 +976,6 @@ if __name__ == "__main__":
     test_proposal = ModelProposal(proposal_id=0, iteration=0, channels=args.channels,
                                    param_config={}, rationale=f"CLI test: {args.channels}")
     report = fit_proposal(test_proposal, specimen_id=specimen_id,
-                          data_dir=str(data_dir), epochs=args.epochs)
+                          data_dir=str(data_dir), epochs=args.epochs,
+                          phase_fraction=args.phase_fraction)
     print(report.generate_feedback())
