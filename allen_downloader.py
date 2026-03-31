@@ -7,10 +7,10 @@ from the Allen Cell Types Database, extracts sweeps by stimulus type, splits
 into training and held-out sets, and loads precomputed electrophysiology features.
 
 Usage:
-    python allen_pv_pipeline.py                    # full pipeline
-    python allen_pv_pipeline.py --list-only        # just list PV+ cells, no download
-    python allen_pv_pipeline.py --max-cells 5      # download only 5 cells (for testing)
-    python allen_pv_pipeline.py --cache-dir ./data  # custom cache directory
+    python allen_downloader.py                    # full pipeline
+    python allen_downloader.py --list-only        # just list PV+ cells, no download
+    python allen_downloader.py --max-cells 5      # download only 5 cells (for testing)
+    python allen_downloader.py --cache-dir ./data  # custom cache directory
 
 Output structure:
     {cache_dir}/
@@ -159,6 +159,156 @@ def get_sweep_inventory(ctc: CellTypesCache, specimen_id: int) -> dict:
         "sweeps_by_category": dict(by_category),
         "total_sweeps": len(sweeps),
     }
+
+
+# ---------------------------------------------------------------------------
+# 2b. Robust Spike Detection from Raw Voltage Traces
+# ---------------------------------------------------------------------------
+
+def count_spikes_from_trace(response: np.ndarray, sampling_rate: float,
+                            stimulus: np.ndarray = None,
+                            threshold_mV: float = None) -> dict:
+    """
+    Count spikes directly from a voltage trace when Allen metadata is missing.
+
+    Uses an adaptive threshold based on Vrest (pre-stimulus baseline).
+    If no stimulus array is provided, uses the first 10% of the trace as baseline.
+
+    Returns dict with:
+        - num_spikes: int
+        - vrest_mV: float (estimated resting potential)
+        - threshold_mV: float (threshold used for detection)
+        - spike_times_ms: list of spike peak times in ms
+    """
+    # Convert to mV if values look like they're in volts (< 1.0 range)
+    v = np.array(response, dtype=np.float64)
+    if np.abs(np.median(v)) < 0.2:  # probably in volts
+        v = v * 1e3  # convert to mV
+
+    n_samples = len(v)
+    dt_s = 1.0 / sampling_rate
+    dt_ms = dt_s * 1e3
+
+    # ---- Determine pre-stimulus baseline for Vrest ----
+    if stimulus is not None:
+        stim = np.array(stimulus, dtype=np.float64)
+        # Find stimulus onset: first index where |stimulus| > 5% of max
+        stim_abs = np.abs(stim)
+        stim_max = np.max(stim_abs) if np.max(stim_abs) > 0 else 1.0
+        onset_mask = stim_abs > 0.05 * stim_max
+        if np.any(onset_mask):
+            onset_idx = np.argmax(onset_mask)
+            # Use 80% of pre-stimulus period, skip first 5% for settling
+            skip = max(1, int(onset_idx * 0.05))
+            baseline_end = max(skip + 10, int(onset_idx * 0.80))
+            baseline_v = v[skip:baseline_end]
+        else:
+            # No detectable stimulus — use first 10%
+            baseline_v = v[:max(10, n_samples // 10)]
+    else:
+        baseline_v = v[:max(10, n_samples // 10)]
+
+    vrest = float(np.median(baseline_v))
+
+    # ---- Adaptive spike threshold ----
+    # For cortical neurons: Vrest is typically -60 to -75 mV,
+    # spike threshold is typically -40 to -20 mV.
+    # Use midpoint between Vrest and a generous spike peak estimate,
+    # but clamp to physiological range.
+    if threshold_mV is None:
+        # Adaptive: halfway between Vrest and -10 mV (conservative peak estimate)
+        threshold_mV = max(-30.0, min(-10.0, (vrest + (-10.0)) / 2.0))
+        # But never lower than Vrest + 15 mV (need clear separation from baseline)
+        threshold_mV = max(threshold_mV, vrest + 15.0)
+
+    # ---- Detect upward threshold crossings ----
+    above = v > threshold_mV
+    crossings = np.diff(above.astype(np.int32)) > 0  # False->True transitions
+    crossing_indices = np.where(crossings)[0]
+
+    # ---- Refine: find actual peak within each crossing, enforce refractory period ----
+    min_refractory_ms = 1.5  # minimum inter-spike interval for cortical neurons
+    min_refractory_samples = max(1, int(min_refractory_ms / dt_ms))
+
+    spike_peaks = []
+    last_peak_idx = -min_refractory_samples - 1
+
+    for cross_idx in crossing_indices:
+        if cross_idx - last_peak_idx < min_refractory_samples:
+            continue  # too close to last spike — skip
+
+        # Search for peak within 2 ms after crossing
+        search_end = min(n_samples, cross_idx + int(2.0 / dt_ms) + 1)
+        peak_idx = cross_idx + np.argmax(v[cross_idx:search_end])
+
+        # Validate: peak must be substantially above threshold
+        peak_v = v[peak_idx]
+        if peak_v < threshold_mV + 5.0:
+            continue  # marginal crossing, not a real spike
+
+        spike_peaks.append(peak_idx)
+        last_peak_idx = peak_idx
+
+    spike_times_ms = [float(idx * dt_ms) for idx in spike_peaks]
+
+    return {
+        "num_spikes": len(spike_peaks),
+        "vrest_mV": vrest,
+        "threshold_mV": threshold_mV,
+        "spike_times_ms": spike_times_ms,
+    }
+
+
+def enrich_sweep_spike_counts(data_set, sweeps: list,
+                              sampling_rate: float = None) -> int:
+    """
+    For a list of sweep dicts where num_spikes is None, load the raw
+    voltage trace and count spikes directly. Mutates the sweep dicts
+    in-place (sets 'num_spikes' and 'spike_detection_method').
+
+    Tries three methods in order:
+      1. Allen's get_spike_times() — if available and non-empty
+      2. Direct voltage trace threshold crossing — always works
+
+    Returns the number of sweeps that were enriched.
+    """
+    enriched = 0
+    for sw in sweeps:
+        if sw.get("num_spikes") is not None:
+            continue  # already has metadata
+
+        sweep_number = sw["sweep_number"]
+        try:
+            # Method 1: Try Allen's precomputed spike times
+            spike_times = data_set.get_spike_times(sweep_number)
+            if len(spike_times) > 0:
+                sw["num_spikes"] = int(len(spike_times))
+                sw["spike_detection_method"] = "allen_spike_times"
+                enriched += 1
+                continue
+        except Exception:
+            pass
+
+        try:
+            # Method 2: Count from raw voltage trace
+            sweep_data = data_set.get_sweep(sweep_number)
+            idx = sweep_data["index_range"]
+            response = sweep_data["response"][idx[0]:idx[1]+1]
+            stimulus = sweep_data["stimulus"][idx[0]:idx[1]+1]
+            sr = sweep_data["sampling_rate"]
+
+            result = count_spikes_from_trace(response, sr, stimulus=stimulus)
+            sw["num_spikes"] = result["num_spikes"]
+            sw["vrest_mV"] = result["vrest_mV"]
+            sw["spike_detection_method"] = "trace_threshold"
+            enriched += 1
+        except Exception as e:
+            logger.warning(f"    Could not count spikes for sweep {sweep_number}: {e}")
+            sw["num_spikes"] = 0
+            sw["spike_detection_method"] = "failed"
+            enriched += 1
+
+    return enriched
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +488,8 @@ def run_pipeline(cache_dir: str = "cell_types_data",
       2. Download ephys features
       3. For each cell: get sweep inventory, make train/held-out split, validate
       4. Optionally download NWB files and verify sweep extraction
-      5. Save all metadata to disk
+      5. Enrich sweep spike counts from raw traces when metadata is missing
+      6. Save all metadata to disk
     """
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -398,6 +549,36 @@ def run_pipeline(cache_dir: str = "cell_types_data",
             logger.error(f"  Failed to get sweeps: {e}")
             skipped_cells.append({"id": specimen_id, "reason": str(e)})
             continue
+
+        # --- Step 4b: Enrich spike counts from NWB when metadata is missing ---
+        # Check if any long_square sweeps are missing num_spikes
+        ls_sweeps = inventory["sweeps_by_category"].get("long_square", [])
+        missing_count = sum(1 for sw in ls_sweeps if sw.get("num_spikes") is None)
+
+        if missing_count > 0 and download_nwb:
+            logger.info(f"  {missing_count}/{len(ls_sweeps)} long_square sweeps "
+                        f"missing num_spikes — scanning raw traces...")
+            try:
+                data_set = ctc.get_ephys_data(specimen_id)
+                n_enriched = enrich_sweep_spike_counts(data_set, ls_sweeps)
+                logger.info(f"  Enriched {n_enriched} sweeps with spike counts "
+                            f"from raw traces")
+
+                # Log summary of what we found
+                spiking = [sw for sw in ls_sweeps
+                           if (sw.get("num_spikes") or 0) > 0]
+                if spiking:
+                    best = max(spiking, key=lambda s: s["num_spikes"])
+                    logger.info(
+                        f"  Best spiking sweep: #{best['sweep_number']} "
+                        f"({best.get('stimulus_amplitude', '?')} pA, "
+                        f"{best['num_spikes']} spikes, "
+                        f"method={best.get('spike_detection_method', '?')})")
+                else:
+                    logger.warning(f"  No spiking sweeps found even after "
+                                   f"trace scanning!")
+            except Exception as e:
+                logger.error(f"  Failed to enrich spike counts: {e}")
 
         split = make_train_heldout_split(inventory)
         is_valid, reason = validate_cell(inventory, split)

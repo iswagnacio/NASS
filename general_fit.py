@@ -16,10 +16,13 @@ Bound architecture:
 The LLM sees trace features in its prompt and makes all biophysical decisions.
 This module does NOT second-guess the LLM's choices — it only prevents NaN.
 
-Training uses phased loss:
-    Phase 1 (epochs 0 to phase_switch): spike_count + stats + MSE only (no timing)
-    Phase 2 (epochs phase_switch to end): full loss with spike_timing added
-    This prevents the optimizer from suppressing spiking to avoid timing penalties.
+Training uses multi-start probing + phased loss:
+    Probe phase: K diverse inits × 40 epochs (Phase 1 only) → pick winner
+    Phase 1 (remaining epochs to phase_switch): spike_count + stats + MSE only
+    Phase 2 (phase_switch to end): full loss with spike_timing added
+
+This eliminates initialization sensitivity — the main failure mode where
+50%+ of iterations land in the non-spiking basin due to unlucky init values.
 """
 
 # ---- JAX config must come before any JAX imports ----
@@ -66,18 +69,12 @@ logger = logging.getLogger(__name__)
 # Channel Resolution
 # ===========================================================================
 
-# REVERTED: NaCortical caused numerical instability (NaN every 10 epochs, 0 spikes).
-# Going back to standard HH Na which achieved 44/56 spikes in pre-refactor testing.
-# NaCortical available as "NaCortical" if needed for future investigation.
 BUILTIN_CHANNELS = {"Na": Na, "NaCortical": NaCortical, "K": K, "Leak": Leak}
 CUSTOM_CHANNELS = {name: info["class"] for name, info in CHANNEL_REGISTRY.items()}
 ALL_CHANNELS = {**BUILTIN_CHANNELS, **CUSTOM_CHANNELS}
 
-# Fallback bounds used when the LLM omits a parameter from param_config.
-# These are conservative defaults — the LLM should override them with
-# informed choices based on the trace features it receives in its prompt.
 FALLBACK_PARAM_BOUNDS = {
-    "Na_gNa":    {"init": 0.10, "lower": 0.01,  "upper": 0.20},  # Reverted to standard HH
+    "Na_gNa":    {"init": 0.10, "lower": 0.01,  "upper": 0.20},
     "K_gK":      {"init": 0.005, "lower": 0.001, "upper": 0.05},
     "Leak_gLeak":{"init": 0.0001,"lower": 1e-5,  "upper": 0.002},
     "Leak_eLeak":{"init": -70.0, "lower": -85.0, "upper": -50.0},
@@ -93,7 +90,6 @@ FALLBACK_PARAM_BOUNDS = {
     "radius":    {"init": 10.0,  "lower": 3.0,   "upper": 12.0},
 }
 
-# Backwards-compatible alias
 DEFAULT_PARAM_BOUNDS = FALLBACK_PARAM_BOUNDS
 
 CHANNEL_CONDUCTANCE_PARAMS = {
@@ -119,9 +115,6 @@ def _clamp_param_bounds(name: str, cfg: dict,
                         adaptive_limits: tuple = None) -> dict:
     """
     Clamp LLM-proposed bounds for gradient safety ONLY.
-
-    If adaptive_limits are provided (from auto_bounds.get_adaptive_hard_limits),
-    uses spike-count-adaptive limits. Otherwise uses static fallback.
     """
     if adaptive_limits is not None:
         hard_ceilings, hard_floors, hard_globals = adaptive_limits
@@ -129,7 +122,6 @@ def _clamp_param_bounds(name: str, cfg: dict,
             name, cfg, hard_ceilings, hard_floors, hard_globals
         )
 
-    # Static fallback (only used if auto_bounds unavailable)
     cfg = dict(cfg)
     _STATIC_CEILINGS = {
         "Na_gNa": 0.50, "K_gK": 0.10, "Leak_gLeak": 0.005,
@@ -166,22 +158,7 @@ def _ensure_init_margin(init_val, lower, upper, margin_frac=0.05):
 def _geometry_bounds_from_proposal(proposal: ModelProposal) -> dict:
     """
     Derive radius/capacitance bounds from the LLM's proposal geometry.
-
-    The LLM proposes explicit geometry values (radius, capacitance).
-    We use them as init and constrain the optimizer to ±25% for radius
-    and ±30% for capacitance. This prevents the optimizer from inflating
-    radius to suppress spiking (the radius-inflation exploit), while
-    still letting it fine-tune geometry within a reasonable range.
-
-    Radius is tighter (±25%) because the optimizer strongly exploits
-    radius inflation to dilute current density and avoid spiking.
-    Capacitance is slightly looser (±30%) as it's less exploitable.
-
-    This is NOT hardcoding — each neuron type gets different geometry via
-    the LLM's per-cell proposal. PV+ FS cells get small radii (~8 µm),
-    pyramidals get larger (~15 µm), etc.
-
-    Returns dict of {param_name: {init, lower, upper}} overrides.
+    ±25% for radius, ±30% for capacitance.
     """
     overrides = {}
 
@@ -189,7 +166,7 @@ def _geometry_bounds_from_proposal(proposal: ModelProposal) -> dict:
         r = float(proposal.radius)
         overrides["radius"] = {
             "init": r,
-            "lower": max(r * 0.75, 1.5),   # at least 1.5 µm
+            "lower": max(r * 0.75, 1.5),
             "upper": r * 1.25,
         }
 
@@ -212,18 +189,6 @@ def build_cell_from_proposal(proposal: ModelProposal,
                               adaptive_limits: tuple = None) -> tuple:
     """
     Build a Jaxley single-compartment cell from a ModelProposal.
-
-    The LLM's param_config is used directly — only gradient safety
-    clamping is applied. For parameters the LLM omits, FALLBACK_PARAM_BOUNDS
-    provides defaults. Geometry bounds are derived from the proposal's
-    radius/capacitance fields (±25%/±30%).
-
-    Args:
-        proposal:         ModelProposal from the LLM
-        adaptive_limits:  Gradient safety limits from get_adaptive_hard_limits()
-
-    Returns:
-        (cell, trainable_params, error_message)
     """
     invalid = [ch for ch in proposal.channels if ch not in ALL_CHANNELS]
     if invalid:
@@ -247,7 +212,6 @@ def build_cell_from_proposal(proposal: ModelProposal,
         comp.set("eNa", 50.0)
         comp.set("eK", -90.0)
 
-        # Set initial values from LLM's param_config or fallback
         for ch_name in channels:
             for param_name in CHANNEL_CONDUCTANCE_PARAMS.get(ch_name, []):
                 if param_name in proposal.param_config:
@@ -268,7 +232,6 @@ def build_cell_from_proposal(proposal: ModelProposal,
     except Exception as e:
         return None, None, f"Cell construction failed: {e}\n{traceback.format_exc()}"
 
-    # Collect trainable parameters
     trainable = []
     geometry_overrides = _geometry_bounds_from_proposal(proposal)
 
@@ -284,7 +247,6 @@ def build_cell_from_proposal(proposal: ModelProposal,
             trainable.append({"name": param_name, "lower": cfg["lower"], "upper": cfg["upper"]})
 
     for param_name in GLOBAL_TRAINABLE:
-        # Priority: param_config > geometry_overrides > fallback
         if param_name in proposal.param_config:
             cfg = _clamp_param_bounds(param_name, proposal.param_config[param_name],
                                       adaptive_limits)
@@ -306,18 +268,14 @@ def build_cell_from_proposal(proposal: ModelProposal,
 
 def _build_shared_loss_components(target_v, dt, n_windows=10,
                                    spike_threshold=-20.0):
-    """
-    Pre-compute all target-derived quantities shared by Phase 1 and Phase 2
-    loss functions. Avoids duplicating expensive target preprocessing.
-
-    Returns a dict of JAX arrays and scalars.
-    """
+    """Pre-compute target-derived quantities shared by Phase 1 and Phase 2."""
     target_np = np.array(target_v)
     n_total = len(target_np)
     win_size = n_total // n_windows
 
     tgt_crossings = np.diff((target_np > spike_threshold).astype(int)) > 0
-    target_spike_count = max(float(np.sum(tgt_crossings)), 1.0)
+    raw_target_spike_count = int(np.sum(tgt_crossings))
+    target_spike_count = max(float(raw_target_spike_count), 1.0)  # floored for loss division
 
     target_means, target_stds = [], []
     for w in range(n_windows):
@@ -347,6 +305,7 @@ def _build_shared_loss_components(target_v, dt, n_windows=10,
         "n_windows": n_windows,
         "win_size": win_size,
         "target_spike_count": target_spike_count,
+        "raw_target_spike_count": raw_target_spike_count,
         "tgt_means": jnp.array(target_means),
         "tgt_stds": jnp.array(target_stds),
         "mean_scale": 8.0,
@@ -364,14 +323,7 @@ def _build_shared_loss_components(target_v, dt, n_windows=10,
 def _build_phase1_loss_fn(cell, target_v, dt, transform, param_names,
                            shared, mse_weight=0.1, stats_weight=5.0,
                            spike_count_weight=300.0):
-    """
-    Phase 1 loss: spike_count + windowed_stats + MSE.
-    NO spike timing penalty.
-
-    This lets the optimizer find spiking solutions without being penalized
-    for spike misalignment. Once spiking is established, Phase 2 adds
-    timing to refine spike positions.
-    """
+    """Phase 1 loss: spike_count + windowed_stats + MSE. NO timing."""
     n_windows = shared["n_windows"]
     win_size = shared["win_size"]
     target_spike_count = shared["target_spike_count"]
@@ -414,7 +366,6 @@ def _build_phase1_loss_fn(cell, target_v, dt, transform, param_names,
             soft_count = jnp.sum(soft_events)
             spike_loss = (soft_count / target_spike_count - 1.0) ** 2
 
-            # NO timing_loss in Phase 1
             total = (mse_weight * mse + stats_weight * stats_loss
                      + spike_count_weight * spike_loss)
         except Exception:
@@ -428,11 +379,7 @@ def _build_phase2_loss_fn(cell, target_v, dt, transform, param_names,
                            shared, mse_weight=0.1, stats_weight=5.0,
                            spike_count_weight=300.0,
                            spike_timing_weight=100.0):
-    """
-    Phase 2 (full) loss: spike_count + spike_timing + windowed_stats + MSE.
-
-    All four components active. Used after Phase 1 has established spiking.
-    """
+    """Phase 2 (full) loss: spike_count + spike_timing + windowed_stats + MSE."""
     n_windows = shared["n_windows"]
     win_size = shared["win_size"]
     target_spike_count = shared["target_spike_count"]
@@ -478,12 +425,15 @@ def _build_phase2_loss_fn(cell, target_v, dt, transform, param_names,
             soft_count = jnp.sum(soft_events)
             spike_loss = (soft_count / target_spike_count - 1.0) ** 2
 
-            sim_smoothed = jnp.convolve(soft_events, timing_kernel, mode='same') / tgt_peak
-            n_timing = min(len(sim_smoothed), len(tgt_smoothed))
-            timing_loss = jnp.mean((sim_smoothed[:n_timing] - tgt_smoothed[:n_timing]) ** 2)
+            # Timing loss
+            sim_smoothed = jnp.convolve(soft_events, timing_kernel, mode='same')
+            sim_smoothed = sim_smoothed / jnp.maximum(jnp.max(sim_smoothed), 1e-8)
+            n_t = min(len(sim_smoothed), len(tgt_smoothed))
+            timing_loss = jnp.mean((sim_smoothed[:n_t] - tgt_smoothed[:n_t]) ** 2)
 
             total = (mse_weight * mse + stats_weight * stats_loss
-                     + spike_count_weight * spike_loss + spike_timing_weight * timing_loss)
+                     + spike_count_weight * spike_loss
+                     + spike_timing_weight * timing_loss)
         except Exception:
             total = jnp.array(float("inf"))
         return total
@@ -491,133 +441,341 @@ def _build_phase2_loss_fn(cell, target_v, dt, transform, param_names,
     return loss_fn
 
 
-def build_generalized_loss_fn(cell, target_v, dt, transform, param_names,
-                              n_windows=10, mse_weight=0.1,
-                              stats_weight=5.0,
-                              spike_count_weight=300.0,
-                              spike_timing_weight=100.0,
-                              spike_threshold=-20.0):
-    """
-    Backward-compatible wrapper: builds full (Phase 2) loss function.
-
-    Code that calls build_generalized_loss_fn directly (e.g. sim_fit.py)
-    gets the same behavior as before. The phased training only applies
-    inside fit_proposal.
-    """
-    shared = _build_shared_loss_components(target_v, dt, n_windows, spike_threshold)
-    return _build_phase2_loss_fn(cell, target_v, dt, transform, param_names,
-                                 shared, mse_weight, stats_weight,
-                                 spike_count_weight, spike_timing_weight)
-
-
 # ===========================================================================
-# Stimulus Windowing
+# Multi-Start Probe System (NEW)
 # ===========================================================================
 
-def window_to_main_stimulus(stimulus, target_v_jnp, dt, max_duration_ms=1200.0):
-    """Window stimulus and target to the main current step."""
-    stim_np = np.array(stimulus)
-    stim_threshold = np.max(np.abs(stim_np)) * 0.1
-    above = np.abs(stim_np) > stim_threshold
-    active_indices = np.where(above)[0]
+def _generate_diverse_inits(proposal, trainable, n_starts=5, rng_seed=42,
+                            warm_start_params=None):
+    """
+    Generate n_starts diverse parameter initializations for multi-start probing.
 
-    if len(active_indices) > 0:
-        breaks = np.where(np.diff(active_indices) > int(5.0 / dt))[0]
-        main_block = max(np.split(active_indices, breaks + 1), key=len) if len(breaks) > 0 else active_indices
+    Strategy: Perturb the LLM's init values along the dimensions that matter
+    most for basin selection (Na_gNa, Kv3_gKv3, radius).
 
-        pre_pad, post_pad = int(50.0 / dt), int(100.0 / dt)
-        start_idx = max(0, main_block[0] - pre_pad)
-        end_idx = min(len(stim_np), main_block[-1] + post_pad)
-        max_samples = int(max_duration_ms / dt) + 1
-        if (end_idx - start_idx) > max_samples:
-            end_idx = start_idx + max_samples
+    If warm_start_params is provided (fitted params from a previous spiking
+    proposal), it replaces the LLM's init as Start 0. This guarantees at
+    least one probe starts from a known-spiking configuration.
 
-        stimulus = stimulus[start_idx:end_idx]
-        target_v_jnp = target_v_jnp[start_idx:end_idx]
-        t_max = len(stimulus) * dt
-        logger.info(f"  Windowed to main stimulus: [{start_idx*dt:.0f}–{end_idx*dt:.0f}] ms, "
-                    f"{len(stimulus)} steps, {t_max:.0f} ms")
-    elif len(stimulus) * dt > max_duration_ms:
-        n_keep = int(max_duration_ms / dt) + 1
-        stimulus = stimulus[:n_keep]
-        target_v_jnp = target_v_jnp[:n_keep]
-        t_max = max_duration_ms
+    Start 0: warm_start (if available) or LLM's original proposal
+    Start 1: More excitable (higher Na_gNa, lower Kv3)
+    Start 2: Less excitable (lower Na_gNa, higher Kv3)
+    Start 3: Compact geometry (smaller radius + slight Na boost)
+    Start 4: Random perturbation within bounds
+
+    Returns list of (label, overrides_dict) tuples.
+    """
+    rng = np.random.RandomState(rng_seed)
+
+    # Extract the LLM's proposed init values
+    base_inits = {}
+    for t in trainable:
+        name = t["name"]
+        if name in proposal.param_config and "init" in proposal.param_config[name]:
+            base_inits[name] = proposal.param_config[name]["init"]
+
+    def _get_bounds(name):
+        return next((t for t in trainable if t["name"] == name), None)
+
+    # Start 0: warm-start from previous best (if available) or LLM's original
+    if warm_start_params:
+        # Filter to only params that exist in this proposal's trainable set
+        trainable_names = {t["name"] for t in trainable}
+        ws_overrides = {k: v for k, v in warm_start_params.items()
+                        if k in trainable_names}
+        if ws_overrides:
+            starts = [("warm_start", ws_overrides)]
+            # Also include the LLM's original as a separate start
+            starts.append(("original", {}))
+        else:
+            starts = [("original", {})]
     else:
-        t_max = len(stimulus) * dt
+        starts = [("original", {})]
 
-    return stimulus, target_v_jnp, t_max
+    if n_starts >= 2:
+        # Start 1: More excitable
+        overrides = {}
+        if "Na_gNa" in base_inits:
+            b = _get_bounds("Na_gNa")
+            if b:
+                overrides["Na_gNa"] = base_inits["Na_gNa"] + 0.3 * (b["upper"] - base_inits["Na_gNa"])
+        if "Kv3_gKv3" in base_inits:
+            b = _get_bounds("Kv3_gKv3")
+            if b:
+                overrides["Kv3_gKv3"] = base_inits["Kv3_gKv3"] - 0.3 * (base_inits["Kv3_gKv3"] - b["lower"])
+        starts.append(("excitable", overrides))
+
+    if n_starts >= 3:
+        # Start 2: Less excitable
+        overrides = {}
+        if "Na_gNa" in base_inits:
+            b = _get_bounds("Na_gNa")
+            if b:
+                overrides["Na_gNa"] = base_inits["Na_gNa"] - 0.2 * (base_inits["Na_gNa"] - b["lower"])
+        if "Kv3_gKv3" in base_inits:
+            b = _get_bounds("Kv3_gKv3")
+            if b:
+                overrides["Kv3_gKv3"] = base_inits["Kv3_gKv3"] + 0.3 * (b["upper"] - base_inits["Kv3_gKv3"])
+        starts.append(("inhibited", overrides))
+
+    if n_starts >= 4:
+        # Start 3: Compact geometry
+        overrides = {}
+        b = _get_bounds("radius")
+        if b:
+            r_init = base_inits.get("radius", proposal.radius)
+            overrides["radius"] = r_init - 0.4 * (r_init - b["lower"])
+        if "Na_gNa" in base_inits:
+            b_na = _get_bounds("Na_gNa")
+            if b_na:
+                overrides["Na_gNa"] = base_inits["Na_gNa"] + 0.15 * (b_na["upper"] - base_inits["Na_gNa"])
+        starts.append(("compact", overrides))
+
+    if n_starts >= 5:
+        # Start 4: Random within bounds
+        overrides = {}
+        for name in ["Na_gNa", "Kv3_gKv3", "K_gK", "eNa", "radius", "capacitance"]:
+            if name in base_inits:
+                b = _get_bounds(name)
+                if b:
+                    margin = 0.1 * (b["upper"] - b["lower"])
+                    overrides[name] = rng.uniform(b["lower"] + margin, b["upper"] - margin)
+        starts.append(("random", overrides))
+
+    # Extra random starts
+    for i in range(5, n_starts):
+        overrides = {}
+        for name in ["Na_gNa", "Kv3_gKv3", "K_gK", "eNa", "radius"]:
+            if name in base_inits:
+                b = _get_bounds(name)
+                if b:
+                    margin = 0.1 * (b["upper"] - b["lower"])
+                    overrides[name] = rng.uniform(b["lower"] + margin, b["upper"] - margin)
+        starts.append((f"random_{i}", overrides))
+
+    return starts[:n_starts]
+
+
+def _apply_init_overrides(opt_params, transform, trainable, overrides):
+    """
+    Create new opt_params with init overrides applied in optimizer space.
+
+    Works by: forward-transform → override real values → inverse-transform.
+    """
+    if not overrides:
+        return jax.tree.map(lambda x: x.copy(), opt_params)
+
+    real_params = transform.forward(opt_params)
+    param_names = [t["name"] for t in trainable]
+
+    new_real = []
+    for i, name in enumerate(param_names):
+        if name in overrides:
+            val = overrides[name]
+            # Clamp to bounds with margin
+            margin = (trainable[i]["upper"] - trainable[i]["lower"]) * 0.05
+            val = max(trainable[i]["lower"] + margin,
+                      min(trainable[i]["upper"] - margin, val))
+            new_real.append({name: jnp.array(val, dtype=real_params[i][name].dtype)})
+        else:
+            new_real.append({name: real_params[i][name]})
+
+    return transform.inverse(new_real)
+
+
+def _run_probe(opt_params, optimizer, step_fn, n_probe_epochs):
+    """
+    Run a short optimization probe. Returns (best_loss, best_params, n_finite).
+    """
+    opt_state = optimizer.init(opt_params)
+    best_loss = float("inf")
+    best_params = None
+    n_nan = 0
+    n_finite = 0
+
+    for epoch in range(n_probe_epochs):
+        try:
+            opt_params, opt_state, loss_val, grad_ok = step_fn(opt_params, opt_state)
+            loss_float = float(loss_val)
+            grad_finite = bool(grad_ok)
+        except Exception:
+            n_nan += 1
+            if n_nan > 5:
+                break
+            continue
+
+        if np.isnan(loss_float) or np.isinf(loss_float):
+            n_nan += 1
+            if n_nan > 5:
+                break
+            continue
+
+        if not grad_finite:
+            continue
+
+        n_finite += 1
+        if loss_float < best_loss:
+            best_loss = loss_float
+            best_params = jax.tree.map(lambda x: x.copy(), opt_params)
+
+    return best_loss, best_params, n_finite
+
+
+def _count_probe_spikes(best_params, cell, transform, param_names, dt,
+                        spike_threshold=-20.0):
+    """
+    Run one forward simulation with probe's best params and count spikes.
+
+    This is the key signal for spike-aware probe scoring: even 1-2 spikes
+    at epoch 40 means the trajectory has crossed the spiking bifurcation,
+    which is far more predictive of eventual success than raw loss value.
+
+    Returns n_spikes (int). Returns 0 on any failure.
+    """
+    if best_params is None:
+        return 0
+    try:
+        real_params = transform.forward(best_params)
+        param_state = None
+        for i, name in enumerate(param_names):
+            param_state = cell.data_set(name, real_params[i][name], param_state)
+        v = jx.integrate(cell, param_state=param_state, delta_t=dt)
+        v_sim = np.array(v[0])
+        crossings = np.diff((v_sim > spike_threshold).astype(int)) > 0
+        return int(np.sum(crossings))
+    except Exception:
+        return 0
+
+
+def _score_probe(n_spikes, loss, n_finite, n_probe_epochs, target_spike_count):
+    """
+    Spike-aware probe scoring. Lower score = better.
+
+    Two regimes based on whether the target itself spikes:
+
+    SPIKING TARGET (target_spike_count > 0):
+      - Any spiking probe beats any non-spiking probe
+      - Among spiking probes: prefer closer to target count, then lower loss
+      - Non-spiking: score = 1e6 + loss
+
+    NON-SPIKING TARGET (target_spike_count == 0):
+      - Any non-spiking probe beats any spiking probe (flipped)
+      - Among non-spiking probes: prefer lower loss
+      - Spiking: score = 1e6 + n_spikes * 1000 + loss (more spikes = worse)
+
+    NaN-dominated probes (< 20% finite grads) get score = 1e9 in both regimes.
+    """
+    # Penalize probes with too few finite gradients
+    if n_finite < n_probe_epochs * 0.2:
+        return 1e9
+
+    if target_spike_count == 0:
+        # NON-SPIKING TARGET: prefer probes that produce 0 spikes
+        if n_spikes == 0:
+            return loss
+        else:
+            # Spiking probe on a non-spiking target: penalize by spike count
+            return 1e6 + n_spikes * 1000.0 + loss
+    else:
+        # SPIKING TARGET: prefer probes that produce spikes
+        if n_spikes > 0:
+            spike_error = abs(n_spikes - target_spike_count) / max(target_spike_count, 1.0)
+            return spike_error * 1000.0 + loss
+        else:
+            return 1e6 + loss
 
 
 # ===========================================================================
-# Compute Diagnostics
+# Diagnostic Computation
 # ===========================================================================
 
-def compute_diagnostics(v_sim, target_v, dt, proposal, fitted_params, trainable, final_loss):
-    """Compute all diagnostic flags for the outer loop."""
-    n = min(len(v_sim), len(target_v))
-    v_sim, target_v = v_sim[:n], target_v[:n]
+def compute_diagnostics(v_sim, target_np, dt, proposal, fitted_dict,
+                        trainable, best_loss):
+    """Compute post-training diagnostics."""
+    n = min(len(v_sim), len(target_np))
+    v_sim = v_sim[:n]
+    target_np = target_np[:n]
+
     spike_threshold = -20.0
-
     sim_crossings = np.diff((v_sim > spike_threshold).astype(int)) > 0
-    tgt_crossings = np.diff((target_v > spike_threshold).astype(int)) > 0
+    tgt_crossings = np.diff((target_np > spike_threshold).astype(int)) > 0
     n_sim_spikes = int(np.sum(sim_crossings))
-    n_tgt_spikes = int(np.sum(tgt_crossings))
+    n_target_spikes = int(np.sum(tgt_crossings))
 
-    corr = float(np.corrcoef(v_sim, target_v)[0, 1]) if len(v_sim) > 1 else 0.0
-    if np.isnan(corr): corr = 0.0
+    corr = np.corrcoef(v_sim, target_np)[0, 1]
+    if np.isnan(corr):
+        corr = 0.0
 
-    no_spikes = (n_tgt_spikes > 0) and (n_sim_spikes == 0)
-    wrong_firing_rate = False
-    if n_tgt_spikes > 0 and n_sim_spikes > 0:
-        rate_ratio = n_sim_spikes / n_tgt_spikes
-        wrong_firing_rate = rate_ratio < 0.5 or rate_ratio > 2.0
+    model_spikes = n_sim_spikes > 0
+    no_spikes = not model_spikes
+    wrong_fr = abs(n_sim_spikes - n_target_spikes) > max(5, n_target_spikes * 0.3)
 
+    # Check for broad spikes
     broad_spikes = False
-    if n_sim_spikes >= 3:
-        sim_crossing_idxs = np.where(sim_crossings)[0]
-        for idx in sim_crossing_idxs[:5]:
-            if idx + int(2.0 / dt) < len(v_sim):
-                if np.all(v_sim[idx:idx + int(2.0 / dt)] > spike_threshold):
-                    broad_spikes = True
-                    break
+    if model_spikes:
+        sim_spike_indices = np.where(sim_crossings)[0]
+        if len(sim_spike_indices) > 0:
+            widths = []
+            for idx in sim_spike_indices[:5]:
+                above = v_sim[idx:min(idx + 200, n)] > spike_threshold
+                widths.append(np.sum(above) * dt)
+            avg_width = np.mean(widths)
+            broad_spikes = avg_width > 3.0
 
-    excessive_sag = False
-    sub_mask = target_v < -70.0
-    if sub_mask.sum() > 10:
-        tgt_hyp = target_v[sub_mask]
-        sim_hyp = v_sim[sub_mask] if sub_mask.sum() <= len(v_sim) else np.array([])
-        if len(sim_hyp) > 0 and np.min(sim_hyp) < np.min(tgt_hyp) - 10.0:
-            excessive_sag = True
-
-    params_at_bounds = []
-    for t_info in trainable:
-        name, lower, upper = t_info["name"], t_info["lower"], t_info["upper"]
-        if name in fitted_params:
-            val = fitted_params[name]
-            margin = (upper - lower) * 0.02
-            if abs(val - lower) < margin:
-                params_at_bounds.append(f"{name} (at lower={lower})")
-            elif abs(val - upper) < margin:
-                params_at_bounds.append(f"{name} (at upper={upper})")
+    # Parameters at bounds
+    at_bounds = []
+    for t in trainable:
+        name = t["name"]
+        if name in fitted_dict:
+            val = fitted_dict[name]
+            rng = t["upper"] - t["lower"]
+            if rng > 0:
+                if (val - t["lower"]) / rng < 0.02:
+                    at_bounds.append(f"{name}=lower")
+                elif (t["upper"] - val) / rng < 0.02:
+                    at_bounds.append(f"{name}=upper")
 
     return {
-        "final_loss": final_loss, "n_sim_spikes": n_sim_spikes,
-        "n_target_spikes": n_tgt_spikes, "pearson_r": corr,
-        "model_spikes": n_sim_spikes > 0, "no_spikes": no_spikes,
-        "wrong_firing_rate": wrong_firing_rate, "broad_spikes": broad_spikes,
-        "excessive_sag": excessive_sag, "parameters_at_bounds": params_at_bounds,
+        "final_loss": best_loss,
+        "n_sim_spikes": n_sim_spikes,
+        "n_target_spikes": n_target_spikes,
+        "pearson_r": float(corr),
+        "model_spikes": model_spikes,
+        "no_spikes": no_spikes,
+        "wrong_firing_rate": wrong_fr,
+        "broad_spikes": broad_spikes,
+        "excessive_sag": False,
+        "parameters_at_bounds": at_bounds,
     }
 
 
 # ===========================================================================
-# Baseline Extraction Helper (used by OuterLoop too)
+# Stimulus Windowing and Baseline
 # ===========================================================================
 
+def window_to_main_stimulus(stimulus, target_v, dt, max_duration_ms=1200.0):
+    """Window stimulus and target to the main stimulus epoch."""
+    stim_np = np.array(stimulus)
+    stim_threshold = np.max(np.abs(stim_np)) * 0.1
+    active = np.where(np.abs(stim_np) > stim_threshold)[0]
+
+    if len(active) == 0:
+        return stimulus, target_v, len(stimulus) * dt
+
+    onset = active[0]
+    offset = active[-1] + 1
+    max_steps = int(max_duration_ms / dt)
+    end = min(offset + int(50.0 / dt), onset + max_steps, len(stim_np))
+
+    stimulus_win = stimulus[onset:end]
+    target_win = target_v[onset:end]
+    t_max = len(stimulus_win) * dt
+
+    return stimulus_win, target_win, t_max
+
+
 def extract_baseline(stimulus_full, target_v_full, dt):
-    """
-    Extract pre-stimulus baseline voltage from the full (unwindowed) trace.
-    Returns baseline_v array (voltage before stimulus onset).
-    """
+    """Extract pre-stimulus baseline voltage."""
     stim_np = np.array(stimulus_full)
     target_np = np.array(target_v_full)
     stim_threshold = np.max(np.abs(stim_np)) * 0.1
@@ -635,7 +793,7 @@ def extract_baseline(stimulus_full, target_v_full, dt):
 
 
 # ===========================================================================
-# Main Entry Point: fit_proposal
+# Main Entry Point: fit_proposal (with multi-start probe)
 # ===========================================================================
 
 def fit_proposal(
@@ -647,32 +805,31 @@ def fit_proposal(
     lr: float = 0.02,
     max_duration_ms: float = 1200.0,
     phase_fraction: float = 0.5,
+    n_starts: int = 5,
+    warm_start_params: dict = None,
 ) -> DiagnosticReport:
     """
     Fit an agent-proposed model to a neuron's recordings.
 
-    Uses phased loss training:
-        Phase 1 (epochs 0 to phase_switch):
-            spike_count + stats + MSE only. No timing penalty.
-            Goal: find parameters that produce spikes.
-        Phase 2 (epochs phase_switch to end):
-            Full loss with spike_timing added.
-            Goal: align spike timing to target.
+    Uses multi-start probing + phased loss training:
+        Probe: K diverse inits × n_probe_epochs (Phase 1 only) → pick best
+        Phase 1 (remaining to phase_switch): spike_count + stats + MSE
+        Phase 2 (phase_switch to end): adds spike_timing
 
-    The phase_switch epoch is epochs * phase_fraction (default 0.5 = halfway).
+    The multi-start probe eliminates initialization sensitivity by sampling
+    across the spiking/non-spiking bifurcation boundary and selecting the
+    initialization most likely to be in the spiking basin.
 
-    Steps:
-        1. Load training data
-        2. Extract baseline & window to stimulus
-        3. Compute gradient safety limits from trace
-        4. Build cell (LLM's param_config + geometry bounds + gradient safety)
-        5. Build phased loss functions
-        6. Run gradient descent with phase switching
-        7. Return DiagnosticReport
+    Args:
+        warm_start_params: dict of {param_name: float} from a previous best
+            proposal's fitted_params. If provided, used as Start 0 in the
+            multi-start probe (replacing the LLM's init as the baseline).
+            This guarantees at least one probe starts from a known-spiking
+            configuration when revising a working proposal.
     """
     data_dir = Path(data_dir)
     logger.info(f"  fit_proposal: channels={proposal.channels}, "
-                f"specimen={specimen_id}, epochs={epochs}")
+                f"specimen={specimen_id}, epochs={epochs}, n_starts={n_starts}")
 
     # Step 1: Load training data
     try:
@@ -697,7 +854,7 @@ def fit_proposal(
     logger.info(f"  Stimulus window: {len(stimulus)} steps, {t_max:.0f} ms, "
                 f"stim range [{np.min(stimulus):.3f}, {np.max(stimulus):.3f}] nA")
 
-    # Step 3: Compute gradient safety limits from trace features
+    # Step 3: Compute gradient safety limits
     target_np = np.array(target_v_jnp)
     try:
         features = extract_trace_features(target_np, dt, baseline_v=baseline_v)
@@ -706,7 +863,7 @@ def fit_proposal(
         logger.warning(f"  Feature extraction failed ({e}), using static safety limits")
         adaptive_limits = None
 
-    # Step 4: Build cell — LLM's param_config + geometry bounds + gradient safety
+    # Step 4: Build cell
     cell, trainable, error = build_cell_from_proposal(proposal, adaptive_limits=adaptive_limits)
     if error:
         logger.error(f"  Cell construction failed: {error}")
@@ -741,42 +898,24 @@ def fit_proposal(
                                 final_loss=float("inf"), no_spikes=True)
 
     # Step 6: Build phased loss functions
-    param_names = [t["name"] for t in trainable]
-    logger.info(f"  Trainable parameters ({len(param_names)}): {param_names}")
-
     phase_switch = int(epochs * phase_fraction)
-    logger.info(f"  Phased training: Phase 1 epochs [0, {phase_switch}), "
-                f"Phase 2 epochs [{phase_switch}, {epochs})")
-
     shared = _build_shared_loss_components(target_v_jnp, dt)
 
-    logger.info(f"  Loss function: target_spikes={int(shared['target_spike_count'])}, "
-                f"mse_weight=0.1, stats_weight=5.0, "
-                f"spike_count_weight=300.0, spike_timing_weight=100.0")
-    logger.info(f"  Spike timing kernel: sigma={shared['sigma_ms']}ms "
-                f"({shared['sigma_steps']:.0f} steps), "
-                f"kernel length={len(shared['timing_kernel'])}")
+    logger.info(f"  Loss: target_spikes={int(shared['target_spike_count'])}, "
+                f"spike_count=300, stats=5, MSE=0.1, timing=100 (Phase 2)")
 
     loss_fn_p1 = _build_phase1_loss_fn(cell, target_v_jnp, dt, transform,
                                         param_names, shared)
     loss_fn_p2 = _build_phase2_loss_fn(cell, target_v_jnp, dt, transform,
                                         param_names, shared)
 
-    logger.info(f"  Phase 1 loss: spike_count=300, stats=5, MSE=0.1, "
-                f"spike_timing=0 (disabled)")
-    logger.info(f"  Phase 2 loss: spike_count=300, spike_timing=100, "
-                f"stats=5, MSE=0.1")
-
     # Step 7: Set up optimizer
     n_extra_channels = max(0, len(proposal.channels) - 3)
     stiffness_factor = 1.0 / (1.0 + 0.5 * n_extra_channels)
     lr_effective = lr * stiffness_factor
-    logger.info(f"  LR scaling: base={lr}, stiffness_factor={stiffness_factor:.2f} "
-                f"({n_extra_channels} extra channels), effective={lr_effective:.4f}")
 
     clip_norm = 5.0 * np.sqrt(8.0 / max(len(param_names), 1))
     clip_norm = max(clip_norm, 1.0)
-    logger.info(f"  Gradient clip norm: {clip_norm:.2f} (for {len(param_names)} params)")
 
     warmup_epochs = min(30, epochs // 5)
     schedule = optax.join_schedules(
@@ -790,10 +929,14 @@ def fit_proposal(
         ],
         boundaries=[warmup_epochs],
     )
-    optimizer = optax.chain(optax.clip_by_global_norm(clip_norm), optax.adam(learning_rate=schedule))
+    optimizer = optax.chain(optax.clip_by_global_norm(clip_norm),
+                            optax.adam(learning_rate=schedule))
     opt_state = optimizer.init(opt_params)
 
-    # Step 8: JIT-compiled training steps for BOTH phases
+    logger.info(f"  Optimizer: lr={lr_effective:.4f}, clip={clip_norm:.2f}, "
+                f"warmup={warmup_epochs}")
+
+    # Step 8: JIT-compiled training steps
     @jit
     def step_phase1(params, opt_state):
         loss_val, grads = value_and_grad(loss_fn_p1)(params)
@@ -820,9 +963,110 @@ def fit_proposal(
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, loss_val, grad_finite
 
-    # Step 9: Training loop with phase switching
+    # ===================================================================
+    # Step 8b: MULTI-START PROBE (NEW)
+    # ===================================================================
+    n_probe_epochs = min(40, phase_switch // 3)  # Don't exceed 1/3 of Phase 1
+    n_probe_epochs = max(20, n_probe_epochs)     # At least 20 epochs
+
+    if n_starts > 1:
+        starts = _generate_diverse_inits(proposal, trainable, n_starts=n_starts,
+                                         warm_start_params=warm_start_params)
+        logger.info(f"  Multi-start probe: {len(starts)} starts × {n_probe_epochs} epochs"
+                     f"{' (with warm-start from previous best)' if warm_start_params else ''}")
+
+        # Build a separate optimizer for probes (fresh LR schedule each time)
+        probe_schedule = optax.cosine_decay_schedule(
+            init_value=lr_effective, decay_steps=n_probe_epochs, alpha=0.1)
+        probe_optimizer = optax.chain(
+            optax.clip_by_global_norm(clip_norm),
+            optax.adam(learning_rate=probe_schedule))
+
+        # JIT a probe step with the probe optimizer
+        @jit
+        def probe_step(params, opt_state):
+            loss_val, grads = value_and_grad(loss_fn_p1)(params)
+            grad_finite = jax.tree.reduce(
+                lambda a, b: a & b,
+                jax.tree.map(lambda g: jnp.all(jnp.isfinite(g)), grads),
+            )
+            safe_grads = jax.tree.map(
+                lambda g: jnp.where(grad_finite, g, jnp.zeros_like(g)), grads)
+            updates, new_opt_state = probe_optimizer.update(safe_grads, opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+            return new_params, new_opt_state, loss_val, grad_finite
+
+        probe_results = []
+        for start_idx, (label, overrides) in enumerate(starts):
+            if overrides:
+                try:
+                    probe_params = _apply_init_overrides(
+                        opt_params, transform, trainable, overrides)
+                except Exception as e:
+                    logger.warning(f"    Start {start_idx} ({label}): "
+                                   f"override failed ({e}), skipping")
+                    continue
+            else:
+                probe_params = jax.tree.map(lambda x: x.copy(), opt_params)
+
+            probe_loss, probe_best, n_finite = _run_probe(
+                probe_params, probe_optimizer, probe_step, n_probe_epochs)
+
+            # Spike-aware scoring: run one forward sim to count spikes
+            n_spikes = _count_probe_spikes(
+                probe_best, cell, transform, param_names, dt)
+            score = _score_probe(
+                n_spikes, probe_loss, n_finite, n_probe_epochs,
+                shared["raw_target_spike_count"])
+
+            probe_results.append({
+                "idx": start_idx, "label": label,
+                "loss": probe_loss, "best_params": probe_best,
+                "n_finite": n_finite, "n_spikes": n_spikes,
+                "score": score,
+            })
+
+            spike_tag = f"{n_spikes} spikes" if n_spikes > 0 else "no spikes"
+            logger.info(f"    Start {start_idx} ({label:>10s}): "
+                         f"loss={probe_loss:.4f}, {spike_tag}, "
+                         f"score={score:.1f}, "
+                         f"finite_grads={n_finite}/{n_probe_epochs}")
+
+        # Select winner using spike-aware score (lower = better)
+        viable = [r for r in probe_results if r["best_params"] is not None]
+
+        if not viable:
+            logger.error("  All multi-start probes failed")
+            return DiagnosticReport(proposal=proposal, specimen_id=specimen_id,
+                                    final_loss=float("inf"), no_spikes=True)
+
+        winner = min(viable, key=lambda r: r["score"])
+
+        # Log the decision rationale
+        n_spiking = sum(1 for r in viable if r["n_spikes"] > 0)
+        logger.info(f"  Probe summary: {n_spiking}/{len(viable)} starts found spikes")
+        spike_tag = f"{winner['n_spikes']} spikes" if winner["n_spikes"] > 0 else "no spikes"
+        logger.info(f"  ★ Winner: Start {winner['idx']} ({winner['label']}) "
+                     f"loss={winner['loss']:.4f}, {spike_tag}, "
+                     f"score={winner['score']:.1f}")
+
+        # Continue from winner
+        opt_params = jax.tree.map(lambda x: x.copy(), winner["best_params"])
+        opt_state = optimizer.init(opt_params)
+        best_loss = winner["loss"]
+        best_params = jax.tree.map(lambda x: x.copy(), winner["best_params"])
+
+        # Adjust phase boundaries (probe consumed some Phase 1 budget)
+        effective_start_epoch = n_probe_epochs
+    else:
+        # Single start (n_starts=1): no probing, original behavior
+        best_loss, best_params = float("inf"), None
+        effective_start_epoch = 0
+
+    # ===================================================================
+    # Step 9: Training loop (continues from probe winner or original)
+    # ===================================================================
     losses = []
-    best_loss, best_params = float("inf"), None
     nan_count, max_nan, nan_grad_count = 0, 15, 0
     patience, epochs_since_best = 50, 0
     divergence_threshold = 3.0
@@ -830,22 +1074,18 @@ def fit_proposal(
     rng = np.random.RandomState(42)
     current_phase = 1
 
-    logger.info(f"  Starting optimisation: {epochs} epochs, lr={lr_effective:.4f} "
-                f"(cosine schedule, warmup={warmup_epochs})")
+    logger.info(f"  Training: epochs [{effective_start_epoch}, {epochs}), "
+                f"phase_switch at {phase_switch}, lr={lr_effective:.4f}")
 
-    for epoch in range(epochs):
-        # ---- Phase switching ----
-        if epoch == phase_switch and current_phase == 1:
+    for epoch in range(effective_start_epoch, epochs):
+        # Phase switching
+        if epoch >= phase_switch and current_phase == 1:
             current_phase = 2
             logger.info(f"  === PHASE SWITCH at epoch {epoch}: "
                         f"adding spike_timing_weight=100.0 ===")
-            # Reset best-loss tracking since the loss function changed.
-            # Phase 2 loss includes timing so absolute values will be higher.
-            # Keep best_params as the starting point — don't lose Phase 1 progress.
             best_loss = float("inf")
             epochs_since_best = 0
 
-        # ---- Select step function for current phase ----
         step_fn = step_phase1 if current_phase == 1 else step_phase2
 
         try:
@@ -854,23 +1094,28 @@ def fit_proposal(
             grad_was_finite = bool(grad_ok)
         except Exception:
             nan_count += 1
-            if nan_count >= max_nan: break
+            if nan_count >= max_nan:
+                break
             if best_params is not None:
                 opt_params = jax.tree.map(
-                    lambda x: x + jitter_scale * jax.numpy.array(rng.randn(*x.shape).astype(np.float32)),
+                    lambda x: x + jitter_scale * jax.numpy.array(
+                        rng.randn(*x.shape).astype(np.float32)),
                     best_params)
                 opt_state = optimizer.init(opt_params)
             continue
 
         if np.isnan(loss_float) or np.isinf(loss_float):
             nan_count += 1
-            if nan_count >= max_nan: break
+            if nan_count >= max_nan:
+                break
             if best_params is not None:
                 opt_params = jax.tree.map(
-                    lambda x: x + jitter_scale * jax.numpy.array(rng.randn(*x.shape).astype(np.float32)),
+                    lambda x: x + jitter_scale * jax.numpy.array(
+                        rng.randn(*x.shape).astype(np.float32)),
                     best_params)
                 opt_state = optimizer.init(opt_params)
-            if nan_count > 3: jitter_scale = min(jitter_scale * 1.5, 0.1)
+            if nan_count > 3:
+                jitter_scale = min(jitter_scale * 1.5, 0.1)
             continue
         else:
             nan_count = 0
@@ -879,7 +1124,8 @@ def fit_proposal(
         if not grad_was_finite:
             nan_grad_count += 1
             if nan_grad_count % 10 == 0:
-                logger.info(f"    Epoch {epoch}: NaN gradient (zeroed), total={nan_grad_count}")
+                logger.info(f"    Epoch {epoch}: NaN gradient (zeroed), "
+                            f"total={nan_grad_count}")
             continue
 
         losses.append(loss_float)
@@ -890,18 +1136,21 @@ def fit_proposal(
         else:
             epochs_since_best += 1
 
-        if best_params is not None and best_loss > 0 and loss_float > best_loss * divergence_threshold:
+        if (best_params is not None and best_loss > 0
+                and loss_float > best_loss * divergence_threshold):
             opt_params = jax.tree.map(lambda x: x.copy(), best_params)
             opt_state = optimizer.init(opt_params)
             epochs_since_best = 0
 
         if epochs_since_best >= patience and epoch > warmup_epochs + patience:
-            logger.info(f"    Early stopping: no improvement for {patience} epochs (best={best_loss:.4f})")
+            logger.info(f"    Early stopping: no improvement for {patience} "
+                        f"epochs (best={best_loss:.4f})")
             break
 
         if epoch % 20 == 0 or epoch == epochs - 1:
             phase_tag = f"[P{current_phase}]"
-            logger.info(f"    Epoch {epoch:4d}  loss={loss_float:.4f}  best={best_loss:.4f}  {phase_tag}")
+            logger.info(f"    Epoch {epoch:4d}  loss={loss_float:.4f}  "
+                        f"best={best_loss:.4f}  {phase_tag}")
 
     # Step 10: Extract fitted parameters
     if best_params is None:
@@ -913,11 +1162,14 @@ def fit_proposal(
     fitted_dict = {}
     for i, name in enumerate(param_names):
         val = fitted[i][name]
-        fitted_dict[name] = float(np.asarray(val).flatten()[0]) if isinstance(val, (list, np.ndarray, jnp.ndarray)) else float(val)
+        fitted_dict[name] = (float(np.asarray(val).flatten()[0])
+                             if isinstance(val, (list, np.ndarray, jnp.ndarray))
+                             else float(val))
 
     logger.info(f"  Fitted parameters: {fitted_dict}")
     logger.info(f"  Best loss: {best_loss:.4f}")
 
+    # Step 11: Final simulation
     try:
         param_state = None
         for i, name in enumerate(param_names):
@@ -929,9 +1181,10 @@ def fit_proposal(
         return DiagnosticReport(proposal=proposal, specimen_id=specimen_id,
                                 final_loss=best_loss, no_spikes=True)
 
-    # Step 11: Diagnostics
+    # Step 12: Diagnostics
     target_np = np.array(target_v_jnp)
-    diag = compute_diagnostics(v_sim, target_np, dt, proposal, fitted_dict, trainable, best_loss)
+    diag = compute_diagnostics(v_sim, target_np, dt, proposal, fitted_dict,
+                               trainable, best_loss)
 
     proposal.fitted_params = fitted_dict
     proposal.loss = best_loss
@@ -941,10 +1194,14 @@ def fit_proposal(
         final_loss=diag["final_loss"], n_sim_spikes=diag["n_sim_spikes"],
         n_target_spikes=diag["n_target_spikes"], pearson_r=diag["pearson_r"],
         model_spikes=diag["model_spikes"], no_spikes=diag["no_spikes"],
-        wrong_firing_rate=diag["wrong_firing_rate"], broad_spikes=diag["broad_spikes"],
-        excessive_sag=diag["excessive_sag"], parameters_at_bounds=diag["parameters_at_bounds"],
+        wrong_firing_rate=diag["wrong_firing_rate"],
+        broad_spikes=diag["broad_spikes"],
+        excessive_sag=diag["excessive_sag"],
+        parameters_at_bounds=diag["parameters_at_bounds"],
     )
-    logger.info(f"  Result: loss={best_loss:.4f}, spikes={diag['n_sim_spikes']}/{diag['n_target_spikes']}, r={diag['pearson_r']:.3f}")
+    logger.info(f"  Result: loss={best_loss:.4f}, "
+                f"spikes={diag['n_sim_spikes']}/{diag['n_target_spikes']}, "
+                f"r={diag['pearson_r']:.3f}")
     return report
 
 
@@ -954,28 +1211,35 @@ def fit_proposal(
 
 if __name__ == "__main__":
     import argparse
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", type=str, default="cell_types_data")
     parser.add_argument("--specimen-id", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=300)
-    parser.add_argument("--channels", nargs="+", default=["Na", "K", "Leak", "Kv3"])
-    parser.add_argument("--phase-fraction", type=float, default=0.5,
-                        help="Fraction of epochs for Phase 1 (no timing loss). Default 0.5")
+    parser.add_argument("--channels", nargs="+",
+                        default=["Na", "K", "Leak", "Kv3"])
+    parser.add_argument("--phase-fraction", type=float, default=0.5)
+    parser.add_argument("--n-starts", type=int, default=5,
+                        help="Number of multi-start probes (1=disable)")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
     if args.specimen_id is None:
         with open(data_dir / "sweep_index.json") as f:
             sweep_index = json.load(f)
-        valid = [int(sid) for sid, e in sweep_index.items() if e.get("valid")]
+        valid = [int(sid) for sid, e in sweep_index.items()
+                 if e.get("valid")]
         specimen_id = valid[0] if valid else None
     else:
         specimen_id = args.specimen_id
 
-    test_proposal = ModelProposal(proposal_id=0, iteration=0, channels=args.channels,
-                                   param_config={}, rationale=f"CLI test: {args.channels}")
-    report = fit_proposal(test_proposal, specimen_id=specimen_id,
-                          data_dir=str(data_dir), epochs=args.epochs,
-                          phase_fraction=args.phase_fraction)
+    test_proposal = ModelProposal(
+        proposal_id=0, iteration=0, channels=args.channels,
+        param_config={}, rationale=f"CLI test: {args.channels}")
+    report = fit_proposal(
+        test_proposal, specimen_id=specimen_id,
+        data_dir=str(data_dir), epochs=args.epochs,
+        phase_fraction=args.phase_fraction,
+        n_starts=args.n_starts)
     print(report.generate_feedback())

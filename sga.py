@@ -210,11 +210,37 @@ class DiagnosticReport:
             lines.append("- **EXCESSIVE SAG**: Reduce IH or adjust Leak_eLeak.")
 
         if self.parameters_at_bounds:
-            lines.append(f"\n- **PARAMETERS AT BOUNDS**: {self.parameters_at_bounds}")
-            lines.append(
-                "These parameters are stuck at their optimisation limits. "
-                "You MUST widen the bounds for these in your param_config.")
-
+            lines.append(f"\\n- **PARAMETERS AT BOUNDS**: {self.parameters_at_bounds}")
+ 
+            # Smart feedback: suppress "widen bounds" for eNa/eK when model
+            # is spiking. Widening eNa when spiking causes the eNa paradox
+            # (taller spikes → deeper Na inactivation → fewer spikes).
+            protected_params = set()
+            if self.model_spikes:
+                if "eNa=upper" in self.parameters_at_bounds:
+                    protected_params.add("eNa")
+                if "eK=lower" in self.parameters_at_bounds:
+                    protected_params.add("eK")
+ 
+            unprotected = [p for p in self.parameters_at_bounds
+                           if not any(p.startswith(pp) for pp in protected_params)]
+ 
+            if unprotected:
+                lines.append(
+                    f"These parameters are stuck at their optimisation limits: "
+                    f"{unprotected}. You should widen the bounds for these in "
+                    f"your param_config.")
+ 
+            if protected_params:
+                protected_list = sorted(protected_params)
+                lines.append(
+                    f"NOTE: {protected_list} hit bounds but the model IS spiking "
+                    f"({self.n_sim_spikes} spikes). Do NOT widen these — the "
+                    f"constrained values are helping produce spikes. Widening eNa "
+                    f"causes deeper Na inactivation and FEWER spikes. Instead, "
+                    f"improve spike count by adjusting Na_gNa, Kv3_gKv3, radius, "
+                    f"or capacitance.")
+                
         if not any([self.no_spikes, self.wrong_firing_rate, self.broad_spikes, self.excessive_sag]):
             lines.append("- No major structural issues detected.")
 
@@ -541,10 +567,31 @@ class OuterLoop:
     def _run_inner_loop(self, proposal: ModelProposal) -> DiagnosticReport:
         logger.info(f"  Inner loop for proposal #{proposal.proposal_id}: {proposal.channels}")
         logger.info(f"  Rationale: {proposal.rationale[:200]}")
+ 
+        # Warm-start: pass previous best's fitted params so the multi-start
+        # probe includes them as Start 0. This guarantees at least one probe
+        # starts from a known-spiking configuration when revising a proposal.
+        warm_start = None
+        best = self.heap.best()
+        if best is not None and best.fitted_params:
+            bd = best.diagnostics
+            best_spiked = False
+            if isinstance(bd, dict):
+                best_spiked = bd.get("n_sim_spikes", 0) > 0
+            elif hasattr(bd, "n_sim_spikes"):
+                best_spiked = bd.n_sim_spikes > 0
+            if best_spiked:
+                warm_start = best.fitted_params
+                n_spk = (bd.get("n_sim_spikes", "?") if isinstance(bd, dict)
+                         else getattr(bd, "n_sim_spikes", "?"))
+                logger.info(f"  Warm-starting from proposal #{best.proposal_id} "
+                            f"(fitted params, {n_spk} spikes)")
+ 
         from general_fit import fit_proposal
         return fit_proposal(proposal=proposal, specimen_id=self.specimen_id,
                             data_dir=str(self.data_dir), epochs=self.inner_epochs,
-                            lr=self.inner_lr)
+                            lr=self.inner_lr, n_starts=5,
+                            warm_start_params=warm_start)
 
     def run(self, max_iterations: int = 5,
             neuron_metadata: dict = None,
