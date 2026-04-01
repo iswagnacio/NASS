@@ -28,6 +28,7 @@ import logging
 import argparse
 from pathlib import Path
 from dataclasses import asdict
+from validation import validate_after_sga
 
 try:
     from dotenv import load_dotenv
@@ -228,6 +229,33 @@ def main():
     print(f"\n  All proposals in heap:")
     for p in loop.heap.top_k():
         print(f"    #{p.proposal_id}: {p.channels} → loss={p.loss:.2f}")
+    
+    # ---- Stage 3: Held-out validation ----
+    if best is not None and best.fitted_params:
+        print("\\n" + "=" * 60)
+        print("STAGE 3: HELD-OUT VALIDATION")
+        print("=" * 60)
+        try:
+            report = validate_after_sga(
+                best_proposal=best,
+                specimen_id=specimen_id,
+                data_dir=str(data_dir),
+                save_plots=True,
+            )
+            if report and report.aggregates.get("overall"):
+                ov = report.aggregates["overall"]
+                print(f"\\n  Overall held-out Γ:      {ov['spike_coincidence_mean']:.3f}")
+                print(f"  Overall held-out FR_err: {ov['firing_rate_error_mean']:.3f}")
+                print(f"  Overall held-out R²:     {ov['subthreshold_r2_mean']:.3f}")
+                print(f"  Overall held-out MSE:    {ov['full_trace_mse_mean']:.1f}")
+            else:
+                print("  No held-out results (missing sweeps or validation failed)")
+        except ImportError:
+            print("  validation.py not found — skipping Stage 3")
+        except Exception as e:
+            print(f"  Stage 3 failed: {e}")
+    else:
+        print("\\n  Skipping Stage 3: no valid fitted model to validate")
 
     print(f"\n  History saved to: {data_dir / 'sga_history.json'}")
     print("=" * 60)
