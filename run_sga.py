@@ -84,6 +84,10 @@ def main():
         "--top-k", type=int, default=5,
         help="Top-K heap size (default: 5)"
     )
+    parser.add_argument(
+        "--n-sweeps", type=int, default=1,
+        help="Number of training sweeps to fit simultaneously (1=single, 2-3=multi)"
+    )
 
     args = parser.parse_args()
 
@@ -184,6 +188,7 @@ def main():
         top_k=args.top_k,
         inner_epochs=args.inner_epochs,
         inner_lr=args.inner_lr,
+        n_sweeps=args.n_sweeps,
     )
 
     best = loop.run(

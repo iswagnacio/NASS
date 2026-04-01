@@ -67,40 +67,100 @@ def load_training_sweep(ctc: CellTypesCache, specimen_id: int,
                         sweep_index: dict) -> dict:
     """
     Load a training long-square sweep for the given specimen.
-    Prefers a sweep with moderate spiking — picks the lowest-amplitude
-    sweep that has spikes (i.e. just above rheobase), then steps up
-    one more to get a sweep with a few more spikes for a richer signal.
-
-    Returns dict with 'time', 'stimulus', 'response', 'sampling_rate' arrays.
+ 
+    Selection priority:
+      1. Use num_spikes from sweep_index metadata (populated by allen_downloader)
+      2. If all num_spikes are None: try Allen's get_spike_times() from NWB
+      3. If that also fails: scan raw voltage traces with adaptive threshold
+ 
+    Among spiking sweeps, picks one ~1/3 into the spiking amplitude range
+    (above rheobase but not so high that we risk depolarization block).
+ 
+    Returns dict with 'time', 'stimulus', 'response', 'sampling_rate',
+    'sweep_number', 'stimulus_amplitude' arrays.
     """
     cell_entry = sweep_index[str(specimen_id)]
     train_sweeps = cell_entry["split"]["training"]["long_square"]
-
+ 
     if not train_sweeps:
         raise ValueError(f"No training sweeps for specimen {specimen_id}")
-
+ 
     # Sort by amplitude
     by_amp = sorted(train_sweeps, key=lambda s: s.get("stimulus_amplitude", 0) or 0)
-
-    # Find sweeps with spikes (num_spikes > 0)
+ 
+    # ---- Phase 1: Use metadata num_spikes ----
     spiking = [sw for sw in by_amp if (sw.get("num_spikes") or 0) > 0]
-
+ 
+    # ---- Phase 2: If metadata missing, try Allen's spike_times ----
     if not spiking:
-        # num_spikes metadata may be missing — check spike_times from NWB directly
-        # for the top few highest-amplitude sweeps
-        logger.info("  num_spikes metadata unavailable; scanning NWB for spiking sweeps...")
+        all_none = all(sw.get("num_spikes") is None for sw in by_amp)
+        if all_none:
+            logger.info("  num_spikes metadata unavailable; "
+                        "trying Allen spike_times from NWB...")
+            data_set = ctc.get_ephys_data(specimen_id)
+            for sw in by_amp:
+                try:
+                    spike_times = data_set.get_spike_times(sw["sweep_number"])
+                    if len(spike_times) > 0:
+                        sw["num_spikes"] = int(len(spike_times))
+                        spiking.append(sw)
+                except Exception:
+                    pass
+ 
+            if spiking:
+                spiking.sort(key=lambda s: s.get("stimulus_amplitude", 0) or 0)
+                logger.info(f"  Found {len(spiking)} spiking sweeps via "
+                            f"Allen spike_times")
+ 
+    # ---- Phase 3: If still nothing, scan raw voltage traces ----
+    if not spiking:
+        logger.info("  Allen spike_times unavailable; scanning raw voltage "
+                    "traces with adaptive threshold...")
+        try:
+            # Import from allen_downloader (same package)
+            from allen_downloader import count_spikes_from_trace
+        except ImportError:
+            # Inline fallback if allen_downloader not importable
+            count_spikes_from_trace = _count_spikes_from_trace_fallback
+ 
         data_set = ctc.get_ephys_data(specimen_id)
-        for sw in reversed(by_amp[-min(8, len(by_amp)):]):
+        scan_results = []
+ 
+        for sw in by_amp:
             try:
-                spike_times = data_set.get_spike_times(sw["sweep_number"])
-                if len(spike_times) > 0:
-                    sw["num_spikes"] = len(spike_times)
+                sweep_data = data_set.get_sweep(sw["sweep_number"])
+                idx_range = sweep_data["index_range"]
+                response = sweep_data["response"][idx_range[0]:idx_range[1]+1]
+                stimulus = sweep_data["stimulus"][idx_range[0]:idx_range[1]+1]
+                sr = sweep_data["sampling_rate"]
+ 
+                result = count_spikes_from_trace(response, sr, stimulus=stimulus)
+                sw["num_spikes"] = result["num_spikes"]
+                sw["vrest_mV"] = result.get("vrest_mV")
+                sw["spike_detection_method"] = "trace_threshold"
+ 
+                scan_results.append(
+                    f"    sweep {sw['sweep_number']}: "
+                    f"{sw.get('stimulus_amplitude', '?'):.0f} pA → "
+                    f"{result['num_spikes']} spikes "
+                    f"(Vrest={result['vrest_mV']:.1f} mV, "
+                    f"thresh={result['threshold_mV']:.1f} mV)")
+ 
+                if result["num_spikes"] > 0:
                     spiking.append(sw)
-            except Exception:
-                pass
-        # Re-sort spiking sweeps by amplitude
-        spiking.sort(key=lambda s: s.get("stimulus_amplitude", 0) or 0)
-
+            except Exception as e:
+                logger.warning(f"    Could not scan sweep "
+                               f"{sw['sweep_number']}: {e}")
+ 
+        for line in scan_results:
+            logger.info(line)
+ 
+        if spiking:
+            spiking.sort(key=lambda s: s.get("stimulus_amplitude", 0) or 0)
+            logger.info(f"  Found {len(spiking)} spiking sweeps via "
+                        f"trace scanning")
+ 
+    # ---- Select the best sweep ----
     if spiking:
         # Pick a sweep ~1/3 into the spiking range (above rheobase but
         # not so high that we risk depolarization block)
@@ -113,36 +173,115 @@ def load_training_sweep(ctc: CellTypesCache, specimen_id: int,
             f"index {idx}/{len(spiking)} spiking sweeps)"
         )
     else:
-        # Fallback: highest amplitude training sweep
+        # Absolute last resort: pick the sweep with the highest amplitude.
+        # This should be rare now — log a loud warning.
         chosen = by_amp[-1]
         logger.warning(
-            f"  No spiking sweeps found! Using highest amplitude sweep "
-            f"{chosen['sweep_number']} ({chosen.get('stimulus_amplitude', '?')} pA)"
+            f"  *** NO SPIKING SWEEPS FOUND for specimen {specimen_id}! ***\n"
+            f"  Using highest amplitude sweep {chosen['sweep_number']} "
+            f"({chosen.get('stimulus_amplitude', '?')} pA) as last resort.\n"
+            f"  This cell may not be suitable for training — consider "
+            f"skipping it."
         )
-
+ 
+    # ---- Load the chosen sweep data ----
     data_set = ctc.get_ephys_data(specimen_id)
     sweep_data = data_set.get_sweep(chosen["sweep_number"])
-
+ 
     idx = sweep_data["index_range"]
     stimulus = sweep_data["stimulus"][idx[0]:idx[1]+1]
     response = sweep_data["response"][idx[0]:idx[1]+1]
     sr = sweep_data["sampling_rate"]
-
+ 
     return {
         "sweep_number": chosen["sweep_number"],
         "stimulus_amplitude": chosen.get("stimulus_amplitude"),
+        "num_spikes": chosen.get("num_spikes"),
         "time": np.arange(len(stimulus)) / sr,
         "stimulus": stimulus,    # Amps
         "response": response,    # Volts
         "sampling_rate": sr,
     }
-
-
+ 
+ 
+def _count_spikes_from_trace_fallback(response, sampling_rate,
+                                       stimulus=None, threshold_mV=None):
+    """
+    Inline fallback spike counter — used only if allen_downloader
+    can't be imported. Mirrors allen_downloader.count_spikes_from_trace().
+    """
+    v = np.array(response, dtype=np.float64)
+    if np.abs(np.median(v)) < 0.2:
+        v = v * 1e3
+ 
+    dt_ms = 1e3 / sampling_rate
+ 
+    # Pre-stimulus baseline for Vrest
+    if stimulus is not None:
+        stim = np.array(stimulus, dtype=np.float64)
+        stim_abs = np.abs(stim)
+        stim_max = np.max(stim_abs) if np.max(stim_abs) > 0 else 1.0
+        onset_mask = stim_abs > 0.05 * stim_max
+        if np.any(onset_mask):
+            onset_idx = int(np.argmax(onset_mask))
+            skip = max(1, int(onset_idx * 0.05))
+            baseline_end = max(skip + 10, int(onset_idx * 0.80))
+            baseline_v = v[skip:baseline_end]
+        else:
+            baseline_v = v[:max(10, len(v) // 10)]
+    else:
+        baseline_v = v[:max(10, len(v) // 10)]
+ 
+    vrest = float(np.median(baseline_v))
+ 
+    if threshold_mV is None:
+        threshold_mV = max(-30.0, min(-10.0, (vrest + (-10.0)) / 2.0))
+        threshold_mV = max(threshold_mV, vrest + 15.0)
+ 
+    above = v > threshold_mV
+    crossings = np.diff(above.astype(np.int32)) > 0
+    crossing_indices = np.where(crossings)[0]
+ 
+    min_refractory_samples = max(1, int(1.5 / dt_ms))
+    spike_peaks = []
+    last_peak_idx = -min_refractory_samples - 1
+ 
+    for cross_idx in crossing_indices:
+        if cross_idx - last_peak_idx < min_refractory_samples:
+            continue
+        search_end = min(len(v), cross_idx + int(2.0 / dt_ms) + 1)
+        peak_idx = cross_idx + np.argmax(v[cross_idx:search_end])
+        if v[peak_idx] < threshold_mV + 5.0:
+            continue
+        spike_peaks.append(peak_idx)
+        last_peak_idx = peak_idx
+ 
+    return {
+        "num_spikes": len(spike_peaks),
+        "vrest_mV": vrest,
+        "threshold_mV": threshold_mV,
+        "spike_times_ms": [float(idx * dt_ms) for idx in spike_peaks],
+    }
+ 
+ 
 def load_multiple_sweeps(ctc: CellTypesCache, specimen_id: int,
                          sweep_index: dict, n_sweeps: int = 3) -> list:
     """
-    Load multiple training sweeps spanning a range of amplitudes.
-    Returns a list of sweep dicts.
+    Load multiple training sweeps for multi-sweep fitting.
+
+    Selection strategy (anchor + spread):
+      1. Find the sweep with the most spikes — this is the anchor
+         (best training signal, most informative for the optimizer)
+      2. Add one sweep below the anchor amplitude (near-rheobase)
+      3. Add one sweep above the anchor amplitude (higher firing rate)
+
+    This ensures the most informative sweep is always included,
+    while also constraining the f-I curve across amplitudes.
+
+    Falls back to evenly-spaced amplitude selection if no spiking
+    sweeps are found (same as original behavior).
+
+    Returns a list of sweep dicts sorted by amplitude.
     """
     cell_entry = sweep_index[str(specimen_id)]
     train_sweeps = cell_entry["split"]["training"]["long_square"]
@@ -151,11 +290,83 @@ def load_multiple_sweeps(ctc: CellTypesCache, specimen_id: int,
         raise ValueError(f"No training sweeps for specimen {specimen_id}")
 
     by_amp = sorted(train_sweeps, key=lambda s: s.get("stimulus_amplitude", 0) or 0)
-    n = min(n_sweeps, len(by_amp))
-    # Sample evenly across amplitude range
-    indices = np.linspace(0, len(by_amp) - 1, n, dtype=int)
-    selected = [by_amp[i] for i in indices]
 
+    # Identify spiking sweeps
+    spiking = [sw for sw in by_amp if (sw.get("num_spikes") or 0) > 0]
+
+    if spiking:
+        # Anchor: sweep with the most spikes
+        anchor = max(spiking, key=lambda s: s.get("num_spikes", 0))
+        anchor_amp = anchor.get("stimulus_amplitude", 0) or 0
+        anchor_idx = by_amp.index(anchor)
+
+        selected = [anchor]
+        selected_numbers = {anchor["sweep_number"]}
+
+        if n_sweeps >= 2:
+            # Add one sweep BELOW anchor (near-rheobase, fewer spikes)
+            # Prefer the spiking sweep closest to rheobase
+            below = [sw for sw in spiking
+                     if (sw.get("stimulus_amplitude", 0) or 0) < anchor_amp
+                     and sw["sweep_number"] not in selected_numbers]
+            if below:
+                # Pick the one with fewest spikes (near-rheobase)
+                choice = min(below, key=lambda s: s.get("num_spikes", 0))
+            else:
+                # No spiking sweep below — pick highest sub-threshold sweep
+                sub = [sw for sw in by_amp
+                       if (sw.get("stimulus_amplitude", 0) or 0) < anchor_amp
+                       and sw["sweep_number"] not in selected_numbers]
+                choice = sub[-1] if sub else None
+
+            if choice:
+                selected.append(choice)
+                selected_numbers.add(choice["sweep_number"])
+
+        if n_sweeps >= 3:
+            # Add one sweep ABOVE anchor (higher amplitude, possibly more spikes)
+            above = [sw for sw in spiking
+                     if (sw.get("stimulus_amplitude", 0) or 0) > anchor_amp
+                     and sw["sweep_number"] not in selected_numbers]
+            if above:
+                # Pick one roughly in the middle of the above range
+                mid_idx = len(above) // 2
+                choice = above[mid_idx]
+            else:
+                # No spiking sweep above — pick the next amplitude up
+                higher = [sw for sw in by_amp
+                          if (sw.get("stimulus_amplitude", 0) or 0) > anchor_amp
+                          and sw["sweep_number"] not in selected_numbers]
+                choice = higher[0] if higher else None
+
+            if choice:
+                selected.append(choice)
+                selected_numbers.add(choice["sweep_number"])
+
+        # Fill remaining slots if n_sweeps > 3
+        if len(selected) < n_sweeps:
+            remaining = [sw for sw in spiking
+                         if sw["sweep_number"] not in selected_numbers]
+            # Spread evenly across remaining spiking sweeps
+            if remaining:
+                n_extra = n_sweeps - len(selected)
+                indices = np.linspace(0, len(remaining) - 1, n_extra, dtype=int)
+                for i in indices:
+                    selected.append(remaining[i])
+                    selected_numbers.add(remaining[i]["sweep_number"])
+
+    else:
+        # No spiking sweeps — fall back to evenly spaced by amplitude
+        logger.warning(f"  No spiking sweeps found for multi-sweep; "
+                       f"using amplitude-spaced selection")
+        n = min(n_sweeps, len(by_amp))
+        indices = np.linspace(0, len(by_amp) - 1, n, dtype=int)
+        selected = [by_amp[i] for i in indices]
+
+    # Sort by amplitude for consistent ordering
+    selected.sort(key=lambda s: s.get("stimulus_amplitude", 0) or 0)
+
+    # Load sweep data from NWB
     data_set = ctc.get_ephys_data(specimen_id)
     results = []
     for sw in selected:
@@ -167,11 +378,17 @@ def load_multiple_sweeps(ctc: CellTypesCache, specimen_id: int,
         results.append({
             "sweep_number": sw["sweep_number"],
             "stimulus_amplitude": sw.get("stimulus_amplitude"),
+            "num_spikes": sw.get("num_spikes"),
             "time": np.arange(len(stimulus)) / sr,
             "stimulus": stimulus,
             "response": response,
             "sampling_rate": sr,
         })
+
+    logger.info(f"  Loaded {len(results)} sweeps: " +
+                ", ".join(f"#{r['sweep_number']}({r.get('stimulus_amplitude', 0):.0f}pA, "
+                          f"{r.get('num_spikes', '?')}sp)"
+                          for r in results))
 
     return results
 

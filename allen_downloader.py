@@ -320,16 +320,26 @@ def make_train_heldout_split(inventory: dict, train_fraction: float = 0.7) -> di
     Split sweeps into training and held-out sets following the proposal:
 
     Training:  Long-square sweeps at a subset of amplitudes (spanning
-               sub-threshold to ~2× rheobase).
+               sub-threshold to ~2x rheobase).
     Held-out:
-        Set 1  — Noise 1 & Noise 2 (all)
-        Set 2  — Ramp (all)
-        Set 3  — Short Square (all)
-        Set 4  — Long-square amplitudes NOT used in training
+        Set 1  -- Noise 1 & Noise 2 (all)
+        Set 2  -- Ramp (all)
+        Set 3  -- Short Square (all)
+        Set 4  -- Long-square amplitudes NOT used in training
 
-    For long-square sweeps we sort by amplitude and assign the first
-    `train_fraction` of unique amplitudes to training, the rest to held-out
-    Set 4.  This tests f-I curve interpolation/extrapolation.
+    For long-square sweeps we split by amplitude, but with a critical
+    constraint: the training set MUST include spiking sweeps if any exist.
+
+    Split logic:
+      1. Sort unique amplitudes ascending
+      2. Find the lowest amplitude with num_spikes > 0 (rheobase estimate)
+      3. If spiking sweeps exist, training gets:
+         - All amplitudes from min up to train_fraction of the total range,
+           OR up to at least 2 amplitudes above rheobase — whichever is larger.
+         This ensures training always includes both sub-threshold AND
+         supra-threshold sweeps for cells with high rheobase.
+      4. If no spiking sweeps exist (all num_spikes are 0 or None),
+         fall back to the original amplitude-fraction split.
     """
     cats = inventory["sweeps_by_category"]
 
@@ -340,17 +350,62 @@ def make_train_heldout_split(inventory: dict, train_fraction: float = 0.7) -> di
             if sw["stimulus_amplitude"] is not None)
     )
 
-    if amplitudes:
-        n_train = max(1, int(len(amplitudes) * train_fraction))
-        train_amps = set(amplitudes[:n_train])
-        heldout_amps = set(amplitudes[n_train:])
-    else:
+    if not amplitudes:
         train_amps, heldout_amps = set(), set()
+    else:
+        # Build a map: amplitude -> max num_spikes at that amplitude
+        amp_spikes = {}
+        for sw in ls_sweeps:
+            amp = sw.get("stimulus_amplitude")
+            if amp is None:
+                continue
+            ns = sw.get("num_spikes") or 0
+            amp_spikes[amp] = max(amp_spikes.get(amp, 0), ns)
+
+        # Find rheobase: lowest amplitude with spikes
+        spiking_amps = [a for a in amplitudes if amp_spikes.get(a, 0) > 0]
+
+        if spiking_amps:
+            rheobase_amp = spiking_amps[0]
+            rheobase_idx = amplitudes.index(rheobase_amp)
+
+            # Default split: first train_fraction of amplitudes
+            n_train_default = max(1, int(len(amplitudes) * train_fraction))
+
+            # Spike-aware split: include at least 2 spiking amplitudes in training
+            # (or all spiking amplitudes if there are fewer than 2)
+            n_spiking_in_train = min(len(spiking_amps), max(2, len(spiking_amps) // 2))
+            # Training must reach at least this far into the amplitude list
+            min_train_idx = amplitudes.index(spiking_amps[n_spiking_in_train - 1])
+            n_train_spike_aware = min_train_idx + 1
+
+            # Take the larger of the two
+            n_train = max(n_train_default, n_train_spike_aware)
+            # But don't take everything — leave at least 1 for held-out if possible
+            n_train = min(n_train, len(amplitudes) - 1) if len(amplitudes) > 1 else len(amplitudes)
+
+            train_amps = set(amplitudes[:n_train])
+            heldout_amps = set(amplitudes[n_train:])
+
+            # Log what happened if we had to override
+            if n_train > n_train_default:
+                logger.info(
+                    f"  Spike-aware split: extended training from {n_train_default} "
+                    f"to {n_train} amplitudes to include spiking sweeps "
+                    f"(rheobase ~{rheobase_amp:.0f} pA, index {rheobase_idx}/{len(amplitudes)})")
+        else:
+            # No spiking sweeps — fall back to amplitude fraction
+            n_train = max(1, int(len(amplitudes) * train_fraction))
+            train_amps = set(amplitudes[:n_train])
+            heldout_amps = set(amplitudes[n_train:])
 
     ls_train = [sw for sw in ls_sweeps
                 if sw["stimulus_amplitude"] in train_amps]
     ls_heldout = [sw for sw in ls_sweeps
                   if sw["stimulus_amplitude"] in heldout_amps]
+
+    # Count spiking sweeps in training for the summary
+    n_train_spiking = sum(1 for sw in ls_train if (sw.get("num_spikes") or 0) > 0)
 
     # ---- Other categories: all go to held-out ----
     split = {
@@ -366,6 +421,7 @@ def make_train_heldout_split(inventory: dict, train_fraction: float = 0.7) -> di
         "summary": {
             "n_train_long_square": len(ls_train),
             "n_train_amplitudes": len(train_amps),
+            "n_train_spiking": n_train_spiking,
             "n_heldout_long_square": len(ls_heldout),
             "n_heldout_amplitudes": len(heldout_amps),
             "n_noise": len(cats.get("noise", [])),

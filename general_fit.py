@@ -807,6 +807,7 @@ def fit_proposal(
     phase_fraction: float = 0.5,
     n_starts: int = 5,
     warm_start_params: dict = None,
+    n_sweeps: int = 1,
 ) -> DiagnosticReport:
     """
     Fit an agent-proposed model to a neuron's recordings.
@@ -836,23 +837,51 @@ def fit_proposal(
         ctc = CellTypesCache(manifest_file=str(data_dir / "manifest.json"))
         with open(data_dir / "sweep_index.json") as f:
             sweep_index = json.load(f)
-        sweep = load_training_sweep(ctc, specimen_id, sweep_index)
-        stimulus, t_max = prepare_stimulus(sweep, dt)
-        target_v = prepare_target(sweep, dt)
-        target_v_jnp = jnp.array(target_v)
+ 
+        if n_sweeps > 1:
+            # Multi-sweep mode
+            from multi_sweep_fitting import load_and_prepare_sweeps
+            sweep_data_list = load_and_prepare_sweeps(
+                ctc, specimen_id, sweep_index, dt=dt,
+                max_duration_ms=max_duration_ms, n_sweeps=n_sweeps)
+            logger.info(f"  Loaded {len(sweep_data_list)} sweeps for multi-sweep fitting")
+ 
+            # Use first spiking sweep for baseline/features (same as single-sweep)
+            primary_sweep = sweep_data_list[0]
+            for sd in sweep_data_list:
+                if sd["shared"].get("raw_target_spike_count", 0) > 0:
+                    primary_sweep = sd
+                    break
+ 
+            # For cell construction: use primary sweep's features
+            baseline_v = primary_sweep["baseline_v"]
+            stimulus = primary_sweep["stimulus"]
+            target_v_jnp = primary_sweep["target_v"]
+            t_max = primary_sweep["t_max"]
+        else:
+            # Single-sweep mode (existing behavior, unchanged)
+            sweep = load_training_sweep(ctc, specimen_id, sweep_index)
+            stimulus, t_max = prepare_stimulus(sweep, dt)
+            target_v = prepare_target(sweep, dt)
+            target_v_jnp = jnp.array(target_v)
+            sweep_data_list = None  # signals single-sweep mode
+ 
     except Exception as e:
         logger.error(f"  Data loading failed: {e}")
         return DiagnosticReport(proposal=proposal, specimen_id=specimen_id,
                                 final_loss=float("inf"), no_spikes=True)
-
-    # Step 2: Extract baseline, then window
-    baseline_v = extract_baseline(stimulus, target_v, dt)
-    logger.info(f"  Baseline: {len(baseline_v)} samples, Vrest={np.mean(baseline_v):.1f} mV")
-
-    stimulus, target_v_jnp, t_max = window_to_main_stimulus(
-        stimulus, target_v_jnp, dt, max_duration_ms)
-    logger.info(f"  Stimulus window: {len(stimulus)} steps, {t_max:.0f} ms, "
-                f"stim range [{np.min(stimulus):.3f}, {np.max(stimulus):.3f}] nA")
+ 
+    # Step 2: Extract baseline, then window (single-sweep only; multi already windowed)
+    if sweep_data_list is None:
+        baseline_v = extract_baseline(stimulus, target_v, dt)
+        logger.info(f"  Baseline: {len(baseline_v)} samples, Vrest={np.mean(baseline_v):.1f} mV")
+ 
+        stimulus, target_v_jnp, t_max = window_to_main_stimulus(
+            stimulus, target_v_jnp, dt, max_duration_ms)
+        logger.info(f"  Stimulus window: {len(stimulus)} steps, {t_max:.0f} ms, "
+                    f"stim range [{np.min(stimulus):.3f}, {np.max(stimulus):.3f}] nA")
+    else:
+        logger.info(f"  Baseline: {len(baseline_v)} samples, Vrest={np.mean(baseline_v):.1f} mV")
 
     # Step 3: Compute gradient safety limits
     target_np = np.array(target_v_jnp)
@@ -876,7 +905,14 @@ def fit_proposal(
 
     # Step 5: Set up simulation
     try:
-        cell = setup_simulation(cell, stimulus, dt, t_max)
+        if sweep_data_list is not None and len(sweep_data_list) > 1:
+            # Multi-sweep: set up with primary sweep's stimulus initially.
+            # The loss functions will re-stimulate per sweep during training.
+            cell = setup_simulation(cell, primary_sweep["stimulus"], dt,
+                                    primary_sweep["t_max"])
+        else:
+            cell = setup_simulation(cell, stimulus, dt, t_max)
+
         for t_info in trainable:
             cell.make_trainable(t_info["name"])
         opt_params = cell.get_parameters()
@@ -899,15 +935,39 @@ def fit_proposal(
 
     # Step 6: Build phased loss functions
     phase_switch = int(epochs * phase_fraction)
-    shared = _build_shared_loss_components(target_v_jnp, dt)
-
-    logger.info(f"  Loss: target_spikes={int(shared['target_spike_count'])}, "
-                f"spike_count=300, stats=5, MSE=0.1, timing=100 (Phase 2)")
-
-    loss_fn_p1 = _build_phase1_loss_fn(cell, target_v_jnp, dt, transform,
-                                        param_names, shared)
-    loss_fn_p2 = _build_phase2_loss_fn(cell, target_v_jnp, dt, transform,
-                                        param_names, shared)
+ 
+    if sweep_data_list is not None and len(sweep_data_list) > 1:
+        # Multi-sweep loss
+        from multi_sweep_fitting import (
+            _build_multisweep_phase1_loss_fn,
+            _build_multisweep_phase2_loss_fn,
+        )
+ 
+        # Log per-sweep target info
+        for sd in sweep_data_list:
+            tc = int(sd["shared"].get("raw_target_spike_count", 0))
+            logger.info(f"    Sweep #{sd['sweep_number']}: "
+                        f"target_spikes={tc}, "
+                        f"{sd['stimulus_amplitude']:.0f} pA")
+ 
+        shared = sweep_data_list[0]["shared"]  # for logging only
+        logger.info(f"  Loss (multi-sweep, {len(sweep_data_list)} sweeps): "
+                    f"spike_count=300, stats=5, MSE=0.1, timing=100 (Phase 2)")
+ 
+        loss_fn_p1 = _build_multisweep_phase1_loss_fn(
+            cell, sweep_data_list, dt, transform, param_names)
+        loss_fn_p2 = _build_multisweep_phase2_loss_fn(
+            cell, sweep_data_list, dt, transform, param_names)
+    else:
+        # Single-sweep loss (existing behavior)
+        shared = _build_shared_loss_components(target_v_jnp, dt)
+        logger.info(f"  Loss: target_spikes={int(shared['target_spike_count'])}, "
+                    f"spike_count=300, stats=5, MSE=0.1, timing=100 (Phase 2)")
+ 
+        loss_fn_p1 = _build_phase1_loss_fn(cell, target_v_jnp, dt, transform,
+                                            param_names, shared)
+        loss_fn_p2 = _build_phase2_loss_fn(cell, target_v_jnp, dt, transform,
+                                            param_names, shared)
 
     # Step 7: Set up optimizer
     n_extra_channels = max(0, len(proposal.channels) - 3)
@@ -1046,7 +1106,7 @@ def fit_proposal(
         n_spiking = sum(1 for r in viable if r["n_spikes"] > 0)
         logger.info(f"  Probe summary: {n_spiking}/{len(viable)} starts found spikes")
         spike_tag = f"{winner['n_spikes']} spikes" if winner["n_spikes"] > 0 else "no spikes"
-        logger.info(f"  ★ Winner: Start {winner['idx']} ({winner['label']}) "
+        logger.info(f"Winner: Start {winner['idx']} ({winner['label']}) "
                      f"loss={winner['loss']:.4f}, {spike_tag}, "
                      f"score={winner['score']:.1f}")
 
@@ -1169,41 +1229,70 @@ def fit_proposal(
     logger.info(f"  Fitted parameters: {fitted_dict}")
     logger.info(f"  Best loss: {best_loss:.4f}")
 
-    # Step 11: Final simulation
-    try:
-        param_state = None
-        for i, name in enumerate(param_names):
-            param_state = cell.data_set(name, fitted[i][name], param_state)
-        v_final = jx.integrate(cell, param_state=param_state, delta_t=dt)
-        v_sim = np.array(v_final[0])
-    except Exception as e:
-        logger.error(f"  Final simulation failed: {e}")
-        return DiagnosticReport(proposal=proposal, specimen_id=specimen_id,
-                                final_loss=best_loss, no_spikes=True)
+    # Step 11: Final simulation (single-sweep only; multi-sweep does this in diagnostics)
+    if sweep_data_list is not None and len(sweep_data_list) > 1:
+        v_sim = None  # diagnostics will handle this
+    else:
+        try:
+            param_state = None
+            for i, name in enumerate(param_names):
+                param_state = cell.data_set(name, fitted[i][name], param_state)
+            v_final = jx.integrate(cell, param_state=param_state, delta_t=dt)
+            v_sim = np.array(v_final[0])
+        except Exception as e:
+            logger.error(f"  Final simulation failed: {e}")
+            return DiagnosticReport(proposal=proposal, specimen_id=specimen_id,
+                                    final_loss=best_loss, no_spikes=True)
 
     # Step 12: Diagnostics
-    target_np = np.array(target_v_jnp)
-    diag = compute_diagnostics(v_sim, target_np, dt, proposal, fitted_dict,
-                               trainable, best_loss)
-
+    if sweep_data_list is not None and len(sweep_data_list) > 1:
+        # Multi-sweep diagnostics
+        from multi_sweep_fitting import compute_multisweep_diagnostics
+        diag = compute_multisweep_diagnostics(
+            cell, sweep_data_list, dt, transform, param_names,
+            best_params, proposal, trainable, best_loss)
+ 
+        # For multi-sweep, also compute parameters_at_bounds
+        at_bounds = []
+        for t in trainable:
+            name = t["name"]
+            if name in fitted_dict:
+                val = fitted_dict[name]
+                rng = t["upper"] - t["lower"]
+                if rng > 0:
+                    if (val - t["lower"]) / rng < 0.02:
+                        at_bounds.append(f"{name}=lower")
+                    elif (t["upper"] - val) / rng < 0.02:
+                        at_bounds.append(f"{name}=upper")
+        diag["parameters_at_bounds"] = at_bounds
+    else:
+        # Single-sweep diagnostics (existing)
+        target_np = np.array(target_v_jnp)
+        diag = compute_diagnostics(v_sim, target_np, dt, proposal, fitted_dict,
+                                   trainable, best_loss)
+    
     proposal.fitted_params = fitted_dict
     proposal.loss = best_loss
-
+    logger.info(f"  diag type: {type(diag)}, keys: {diag.keys() if isinstance(diag, dict) else 'NOT A DICT'}")
     report = DiagnosticReport(
         proposal=proposal, specimen_id=specimen_id,
-        final_loss=diag["final_loss"], n_sim_spikes=diag["n_sim_spikes"],
-        n_target_spikes=diag["n_target_spikes"], pearson_r=diag["pearson_r"],
-        model_spikes=diag["model_spikes"], no_spikes=diag["no_spikes"],
-        wrong_firing_rate=diag["wrong_firing_rate"],
-        broad_spikes=diag["broad_spikes"],
-        excessive_sag=diag["excessive_sag"],
-        parameters_at_bounds=diag["parameters_at_bounds"],
+        final_loss=best_loss,
+        n_sim_spikes=diag.get("n_sim_spikes", 0),
+        n_target_spikes=diag.get("n_target_spikes", 0),
+        pearson_r=diag.get("pearson_r", 0.0),
+        model_spikes=diag.get("model_spikes", False),
+        no_spikes=diag.get("no_spikes", True),
+        wrong_firing_rate=diag.get("wrong_firing_rate", False),
+        broad_spikes=diag.get("broad_spikes", False),
+        excessive_sag=diag.get("excessive_sag", False),
+        parameters_at_bounds=diag.get("parameters_at_bounds", []),
     )
-    logger.info(f"  Result: loss={best_loss:.4f}, "
-                f"spikes={diag['n_sim_spikes']}/{diag['n_target_spikes']}, "
-                f"r={diag['pearson_r']:.3f}")
-    return report
 
+    logger.info(f"  Result: loss={best_loss:.4f}, "
+                f"spikes={diag.get('n_sim_spikes', 0)}/{diag.get('n_target_spikes', 0)}, "
+                f"r={diag.get('pearson_r', 0):.3f}")
+
+    return report
 
 # ===========================================================================
 # CLI
