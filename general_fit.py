@@ -27,7 +27,7 @@ This eliminates initialization sensitivity — the main failure mode where
 
 # ---- JAX config must come before any JAX imports ----
 from jax import config
-config.update("jax_enable_x64", False)
+config.update("jax_enable_x64", True)
 
 import json
 import logging
@@ -289,7 +289,7 @@ def _build_shared_loss_components(target_v, dt, n_windows=10,
     sigma_ms = 2.0
     sigma_steps = sigma_ms / dt
     half_kernel = int(3.0 * sigma_steps)
-    kernel_x = jnp.arange(-half_kernel, half_kernel + 1, dtype=jnp.float32)
+    kernel_x = jnp.arange(-half_kernel, half_kernel + 1)
     timing_kernel = jnp.exp(-kernel_x ** 2 / (2.0 * sigma_steps ** 2))
     timing_kernel = timing_kernel / jnp.sum(timing_kernel)
 
@@ -298,7 +298,18 @@ def _build_shared_loss_components(target_v, dt, n_windows=10,
     tgt_events = np.maximum(tgt_dp, 0.0)
     tgt_smoothed_np = np.convolve(tgt_events, np.array(timing_kernel), mode='same')
     tgt_peak = float(np.max(tgt_smoothed_np)) if float(np.max(tgt_smoothed_np)) > 0 else 1.0
-    tgt_smoothed = jnp.array(tgt_smoothed_np / tgt_peak, dtype=jnp.float32)
+    tgt_smoothed = jnp.array(tgt_smoothed_np / tgt_peak)
+
+    # Pre-stimulus baseline for Vrest matching. Now that the windowed trace
+    # includes a pre-stimulus period, we know the first N samples are baseline
+    # (zero stimulus). This gives the optimizer a clean gradient signal for eLeak.
+    # We identify baseline as samples where |stimulus| < threshold (the pre-stim
+    # portion we included via pre_stim_ms in window_to_main_stimulus).
+    stim_check = np.array(target_v)  # target_v is a jnp array
+    # Find where stimulus is essentially zero — those are the baseline samples.
+    # We use the target trace's first 10% as a fallback estimate.
+    n_baseline_est = max(10, n_total // 20)
+    baseline_vrest = float(np.mean(target_np[:n_baseline_est]))
 
     return {
         "n_total": n_total,
@@ -317,13 +328,16 @@ def _build_shared_loss_components(target_v, dt, n_windows=10,
         "tgt_peak": tgt_peak,
         "sigma_ms": sigma_ms,
         "sigma_steps": sigma_steps,
+        "baseline_vrest": baseline_vrest,
+        "n_baseline_est": n_baseline_est,
     }
 
 
 def _build_phase1_loss_fn(cell, target_v, dt, transform, param_names,
                            shared, mse_weight=0.1, stats_weight=5.0,
-                           spike_count_weight=300.0):
-    """Phase 1 loss: spike_count + windowed_stats + MSE. NO timing."""
+                           spike_count_weight=300.0,
+                           baseline_weight=50.0):
+    """Phase 1 loss: spike_count + windowed_stats + MSE + baseline_vrest. NO timing."""
     n_windows = shared["n_windows"]
     win_size = shared["win_size"]
     target_spike_count = shared["target_spike_count"]
@@ -333,6 +347,8 @@ def _build_phase1_loss_fn(cell, target_v, dt, transform, param_names,
     std_scale = shared["std_scale"]
     spike_k = shared["spike_k"]
     spike_threshold = shared["spike_threshold"]
+    baseline_vrest = shared["baseline_vrest"]
+    n_baseline = shared["n_baseline_est"]
 
     def loss_fn(opt_params):
         params = transform.forward(opt_params)
@@ -366,8 +382,18 @@ def _build_phase1_loss_fn(cell, target_v, dt, transform, param_names,
             soft_count = jnp.sum(soft_events)
             spike_loss = (soft_count / target_spike_count - 1.0) ** 2
 
+            # Baseline Vrest loss: MSE of the pre-stimulus baseline period.
+            # This directly penalizes the model's resting potential being
+            # wrong, giving eLeak a strong gradient signal. Weight=50 means
+            # a 12 mV offset contributes 50*(12^2)/n_baseline ~ 50*144/2000
+            # ~ 3.6 per sample, which is comparable to spike count loss.
+            sim_baseline = v_s[:n_baseline]
+            tgt_baseline = v_t[:n_baseline]
+            baseline_loss = jnp.mean((sim_baseline - tgt_baseline) ** 2)
+
             total = (mse_weight * mse + stats_weight * stats_loss
-                     + spike_count_weight * spike_loss)
+                     + spike_count_weight * spike_loss
+                     + baseline_weight * baseline_loss)
         except Exception:
             total = jnp.array(float("inf"))
         return total
@@ -378,8 +404,9 @@ def _build_phase1_loss_fn(cell, target_v, dt, transform, param_names,
 def _build_phase2_loss_fn(cell, target_v, dt, transform, param_names,
                            shared, mse_weight=0.1, stats_weight=5.0,
                            spike_count_weight=300.0,
-                           spike_timing_weight=100.0):
-    """Phase 2 (full) loss: spike_count + spike_timing + windowed_stats + MSE."""
+                           spike_timing_weight=25.0,
+                           baseline_weight=50.0):
+    """Phase 2 (full) loss: spike_count + spike_timing + windowed_stats + MSE + baseline."""
     n_windows = shared["n_windows"]
     win_size = shared["win_size"]
     target_spike_count = shared["target_spike_count"]
@@ -392,6 +419,8 @@ def _build_phase2_loss_fn(cell, target_v, dt, transform, param_names,
     timing_kernel = shared["timing_kernel"]
     tgt_smoothed = shared["tgt_smoothed"]
     tgt_peak = shared["tgt_peak"]
+    baseline_vrest = shared["baseline_vrest"]
+    n_baseline = shared["n_baseline_est"]
 
     def loss_fn(opt_params):
         params = transform.forward(opt_params)
@@ -431,9 +460,15 @@ def _build_phase2_loss_fn(cell, target_v, dt, transform, param_names,
             n_t = min(len(sim_smoothed), len(tgt_smoothed))
             timing_loss = jnp.mean((sim_smoothed[:n_t] - tgt_smoothed[:n_t]) ** 2)
 
+            # Baseline Vrest loss (same as Phase 1)
+            sim_baseline = v_s[:n_baseline]
+            tgt_baseline = v_t[:n_baseline]
+            baseline_loss = jnp.mean((sim_baseline - tgt_baseline) ** 2)
+
             total = (mse_weight * mse + stats_weight * stats_loss
                      + spike_count_weight * spike_loss
-                     + spike_timing_weight * timing_loss)
+                     + spike_timing_weight * timing_loss
+                     + baseline_weight * baseline_loss)
         except Exception:
             total = jnp.array(float("inf"))
         return total
@@ -592,25 +627,34 @@ def _run_probe(opt_params, optimizer, step_fn, n_probe_epochs):
     best_params = None
     n_nan = 0
     n_finite = 0
+    n_exception = 0
+    n_inf_loss = 0
+    n_nan_grad = 0
+    first_exception = None
 
     for epoch in range(n_probe_epochs):
         try:
             opt_params, opt_state, loss_val, grad_ok = step_fn(opt_params, opt_state)
             loss_float = float(loss_val)
             grad_finite = bool(grad_ok)
-        except Exception:
+        except Exception as e:
             n_nan += 1
+            n_exception += 1
+            if first_exception is None:
+                first_exception = f"{type(e).__name__}: {str(e)[:200]}"
             if n_nan > 5:
                 break
             continue
 
         if np.isnan(loss_float) or np.isinf(loss_float):
             n_nan += 1
+            n_inf_loss += 1
             if n_nan > 5:
                 break
             continue
 
         if not grad_finite:
+            n_nan_grad += 1
             continue
 
         n_finite += 1
@@ -618,17 +662,26 @@ def _run_probe(opt_params, optimizer, step_fn, n_probe_epochs):
             best_loss = loss_float
             best_params = jax.tree.map(lambda x: x.copy(), opt_params)
 
+    if n_finite == 0 and (n_exception > 0 or n_inf_loss > 0 or n_nan_grad > 0):
+        logger.warning(f"      Probe: 0/{min(epoch + 1, n_probe_epochs)} finite — "
+                       f"exc={n_exception}, inf={n_inf_loss}, nan_grad={n_nan_grad}"
+                       f"{f', first_exc: {first_exception}' if first_exception else ''}")
+
     return best_loss, best_params, n_finite
 
 
 def _count_probe_spikes(best_params, cell, transform, param_names, dt,
-                        spike_threshold=-20.0):
+                        spike_threshold=-20.0, sweep_data_list=None):
     """
     Run one forward simulation with probe's best params and count spikes.
 
     This is the key signal for spike-aware probe scoring: even 1-2 spikes
     at epoch 40 means the trajectory has crossed the spiking bifurcation,
     which is far more predictive of eventual success than raw loss value.
+
+    In multi-sweep mode (sweep_data_list is not None), the cell's static
+    stimulus is zero — we must inject the primary sweep's stimulus via
+    data_stimulate() or else the simulation sees no current and never spikes.
 
     Returns n_spikes (int). Returns 0 on any failure.
     """
@@ -639,7 +692,20 @@ def _count_probe_spikes(best_params, cell, transform, param_names, dt,
         param_state = None
         for i, name in enumerate(param_names):
             param_state = cell.data_set(name, real_params[i][name], param_state)
-        v = jx.integrate(cell, param_state=param_state, delta_t=dt)
+
+        if sweep_data_list is not None and len(sweep_data_list) > 0:
+            # Multi-sweep mode: cell has zero static stimulus.
+            # Use the primary sweep (most target spikes) for spike counting.
+            primary = max(sweep_data_list,
+                          key=lambda sd: sd["shared"].get("raw_target_spike_count", 0))
+            data_stimuli = None
+            data_stimuli = cell.data_stimulate(primary["stimulus"], data_stimuli)
+            v = jx.integrate(cell, param_state=param_state,
+                             data_stimuli=data_stimuli, delta_t=dt)
+        else:
+            # Single-sweep mode: real stimulus is baked into cell.externals
+            v = jx.integrate(cell, param_state=param_state, delta_t=dt)
+
         v_sim = np.array(v[0])
         crossings = np.diff((v_sim > spike_threshold).astype(int)) > 0
         return int(np.sum(crossings))
@@ -735,6 +801,31 @@ def compute_diagnostics(v_sim, target_np, dt, proposal, fitted_dict,
                 elif (t["upper"] - val) / rng < 0.02:
                     at_bounds.append(f"{name}=upper")
 
+    # Subthreshold R2 and Vrest mismatch
+    sub_thresh = -30.0
+    sub_mask_tgt = target_np < sub_thresh
+    sub_mask_sim = v_sim < sub_thresh
+    combined_sub = sub_mask_tgt & sub_mask_sim
+
+    if np.sum(combined_sub) > 20:
+        t_sub = target_np[combined_sub]
+        s_sub = v_sim[combined_sub]
+        ss_res = np.sum((t_sub - s_sub) ** 2)
+        ss_tot = np.sum((t_sub - np.mean(t_sub)) ** 2)
+        sub_r2 = max(0.0, 1.0 - ss_res / ss_tot) if ss_tot > 0 else 0.0
+    else:
+        sub_r2 = 0.0
+
+    if np.sum(sub_mask_tgt) > 10:
+        vrest_target = float(np.mean(target_np[sub_mask_tgt]))
+    else:
+        vrest_target = float(np.mean(target_np[:max(10, n // 10)]))
+    if np.sum(sub_mask_sim) > 10:
+        vrest_sim = float(np.mean(v_sim[sub_mask_sim]))
+    else:
+        vrest_sim = float(np.mean(v_sim[:max(10, n // 10)]))
+    vrest_mismatch = vrest_sim - vrest_target
+
     return {
         "final_loss": best_loss,
         "n_sim_spikes": n_sim_spikes,
@@ -746,6 +837,10 @@ def compute_diagnostics(v_sim, target_np, dt, proposal, fitted_dict,
         "broad_spikes": broad_spikes,
         "excessive_sag": False,
         "parameters_at_bounds": at_bounds,
+        "subthreshold_r2": float(sub_r2),
+        "vrest_sim_mV": float(vrest_sim),
+        "vrest_target_mV": float(vrest_target),
+        "vrest_mismatch_mV": float(vrest_mismatch),
     }
 
 
@@ -753,8 +848,14 @@ def compute_diagnostics(v_sim, target_np, dt, proposal, fitted_dict,
 # Stimulus Windowing and Baseline
 # ===========================================================================
 
-def window_to_main_stimulus(stimulus, target_v, dt, max_duration_ms=1200.0):
-    """Window stimulus and target to the main stimulus epoch."""
+def window_to_main_stimulus(stimulus, target_v, dt, max_duration_ms=1200.0,
+                            pre_stim_ms=50.0):
+    """Window stimulus and target to the main stimulus epoch.
+
+    Includes pre_stim_ms of baseline BEFORE stimulus onset so the optimizer
+    can see (and penalize) the model's resting potential mismatch. Without
+    this, the trace starts at stimulus onset and the loss function never
+    sees Vrest, causing eLeak to drift to whatever helps spike count."""
     stim_np = np.array(stimulus)
     stim_threshold = np.max(np.abs(stim_np)) * 0.1
     active = np.where(np.abs(stim_np) > stim_threshold)[0]
@@ -765,10 +866,12 @@ def window_to_main_stimulus(stimulus, target_v, dt, max_duration_ms=1200.0):
     onset = active[0]
     offset = active[-1] + 1
     max_steps = int(max_duration_ms / dt)
-    end = min(offset + int(50.0 / dt), onset + max_steps, len(stim_np))
+    pre_steps = min(int(pre_stim_ms / dt), onset)  # don't go before trace start
+    start = onset - pre_steps
+    end = min(offset + int(50.0 / dt), start + max_steps, len(stim_np))
 
-    stimulus_win = stimulus[onset:end]
-    target_win = target_v[onset:end]
+    stimulus_win = stimulus[start:end]
+    target_win = target_v[start:end]
     t_max = len(stimulus_win) * dt
 
     return stimulus_win, target_win, t_max
@@ -846,18 +949,22 @@ def fit_proposal(
                 max_duration_ms=max_duration_ms, n_sweeps=n_sweeps)
             logger.info(f"  Loaded {len(sweep_data_list)} sweeps for multi-sweep fitting")
  
-            # Use first spiking sweep for baseline/features (same as single-sweep)
-            primary_sweep = sweep_data_list[0]
-            for sd in sweep_data_list:
-                if sd["shared"].get("raw_target_spike_count", 0) > 0:
-                    primary_sweep = sd
-                    break
+            # Use the sweep with the MOST spikes for baseline/features/safety
+            # This is the most informative sweep for gradient safety limits
+            # and trace feature extraction (firing rate, half-width, etc.)
+            primary_sweep = max(
+                sweep_data_list,
+                key=lambda sd: sd["shared"].get("raw_target_spike_count", 0)
+            )
  
             # For cell construction: use primary sweep's features
             baseline_v = primary_sweep["baseline_v"]
             stimulus = primary_sweep["stimulus"]
             target_v_jnp = primary_sweep["target_v"]
             t_max = primary_sweep["t_max"]
+            logger.info(f"  Primary sweep for features: #{primary_sweep['sweep_number']} "
+                        f"({primary_sweep['stimulus_amplitude']:.0f} pA, "
+                        f"{primary_sweep['shared'].get('raw_target_spike_count', 0)} spikes)")
         else:
             # Single-sweep mode (existing behavior, unchanged)
             sweep = load_training_sweep(ctc, specimen_id, sweep_index)
@@ -906,9 +1013,16 @@ def fit_proposal(
     # Step 5: Set up simulation
     try:
         if sweep_data_list is not None and len(sweep_data_list) > 1:
-            # Multi-sweep: set up with primary sweep's stimulus initially.
-            # The loss functions will re-stimulate per sweep during training.
-            cell = setup_simulation(cell, primary_sweep["stimulus"], dt,
+            # Multi-sweep: register a ZERO stimulus to set the simulation
+            # duration and recording. The actual per-sweep stimuli are injected
+            # via data_stimulate() in the loss function.
+            #
+            # CRITICAL: We must NOT use the real stimulus here because
+            # data_stimulate() ADDS to (not replaces) the static externals
+            # registered by cell.stimulate(). Using a real stimulus would
+            # double-stimulate the cell, producing NaN gradients.
+            zero_stim = jnp.zeros_like(primary_sweep["stimulus"])
+            cell = setup_simulation(cell, zero_stim, dt,
                                     primary_sweep["t_max"])
         else:
             cell = setup_simulation(cell, stimulus, dt, t_max)
@@ -941,23 +1055,64 @@ def fit_proposal(
         from multi_sweep_fitting import (
             _build_multisweep_phase1_loss_fn,
             _build_multisweep_phase2_loss_fn,
+            prebuild_data_stimuli,
         )
- 
+
+        # CRITICAL: Pre-build data_stimuli in eager mode (outside JIT).
+        # cell.data_stimulate() has side effects on cell internals that
+        # corrupt the computation graph when called inside JIT-traced code,
+        # producing NaN gradients on the backward pass. Pre-building here
+        # gives us pure JAX data structures safe for closure capture.
+        pre_data_stimuli = prebuild_data_stimuli(cell, sweep_data_list)
+
         # Log per-sweep target info
         for sd in sweep_data_list:
             tc = int(sd["shared"].get("raw_target_spike_count", 0))
             logger.info(f"    Sweep #{sd['sweep_number']}: "
                         f"target_spikes={tc}, "
                         f"{sd['stimulus_amplitude']:.0f} pA")
- 
-        shared = sweep_data_list[0]["shared"]  # for logging only
+
+        # Use primary sweep (most spikes) for probe scoring
+        primary_idx = max(range(len(sweep_data_list)),
+                        key=lambda i: sweep_data_list[i]["shared"].get("raw_target_spike_count", 0))
+        shared = sweep_data_list[primary_idx]["shared"]
         logger.info(f"  Loss (multi-sweep, {len(sweep_data_list)} sweeps): "
                     f"spike_count=300, stats=5, MSE=0.1, timing=100 (Phase 2)")
- 
+
         loss_fn_p1 = _build_multisweep_phase1_loss_fn(
-            cell, sweep_data_list, dt, transform, param_names)
+            cell, sweep_data_list, dt, transform, param_names,
+            pre_data_stimuli=pre_data_stimuli)
         loss_fn_p2 = _build_multisweep_phase2_loss_fn(
-            cell, sweep_data_list, dt, transform, param_names)
+            cell, sweep_data_list, dt, transform, param_names,
+            pre_data_stimuli=pre_data_stimuli)
+
+        # Diagnostic: run one forward pass to verify loss is computable
+        try:
+            diag_loss = loss_fn_p1(opt_params)
+            diag_loss_f = float(diag_loss)
+            logger.info(f"  Multi-sweep diagnostic forward pass: loss={diag_loss_f:.4f}, "
+                        f"finite={np.isfinite(diag_loss_f)}")
+            if not np.isfinite(diag_loss_f):
+                # Run per-sweep sims to identify which sweep fails
+                real_p = transform.forward(opt_params)
+                ps = None
+                for i, name in enumerate(param_names):
+                    ps = cell.data_set(name, real_p[i][name], ps)
+                for si, sd in enumerate(sweep_data_list):
+                    try:
+                        ds = None
+                        ds = cell.data_stimulate(sd["stimulus"], ds)
+                        v_dbg = jx.integrate(cell, param_state=ps,
+                                             data_stimuli=ds, delta_t=dt)
+                        v_np = np.array(v_dbg[0])
+                        logger.info(f"    Sweep #{sd['sweep_number']}: "
+                                    f"v=[{np.min(v_np):.1f}, {np.max(v_np):.1f}], "
+                                    f"nan={np.sum(np.isnan(v_np))}, "
+                                    f"inf={np.sum(np.isinf(v_np))}")
+                    except Exception as e2:
+                        logger.error(f"    Sweep #{sd['sweep_number']}: sim failed: {e2}")
+        except Exception as e:
+            logger.warning(f"  Multi-sweep diagnostic forward pass failed: {e}")
     else:
         # Single-sweep loss (existing behavior)
         shared = _build_shared_loss_components(target_v_jnp, dt)
@@ -1074,7 +1229,8 @@ def fit_proposal(
 
             # Spike-aware scoring: run one forward sim to count spikes
             n_spikes = _count_probe_spikes(
-                probe_best, cell, transform, param_names, dt)
+                probe_best, cell, transform, param_names, dt,
+                sweep_data_list=sweep_data_list)
             score = _score_probe(
                 n_spikes, probe_loss, n_finite, n_probe_epochs,
                 shared["raw_target_spike_count"])
@@ -1128,7 +1284,7 @@ def fit_proposal(
     # ===================================================================
     losses = []
     nan_count, max_nan, nan_grad_count = 0, 15, 0
-    patience, epochs_since_best = 50, 0
+    patience, epochs_since_best = 100, 0
     divergence_threshold = 3.0
     jitter_scale = 0.01
     rng = np.random.RandomState(42)
@@ -1159,7 +1315,7 @@ def fit_proposal(
             if best_params is not None:
                 opt_params = jax.tree.map(
                     lambda x: x + jitter_scale * jax.numpy.array(
-                        rng.randn(*x.shape).astype(np.float32)),
+                        np.array(rng.randn(*x.shape), dtype=x.dtype)),
                     best_params)
                 opt_state = optimizer.init(opt_params)
             continue
@@ -1171,7 +1327,7 @@ def fit_proposal(
             if best_params is not None:
                 opt_params = jax.tree.map(
                     lambda x: x + jitter_scale * jax.numpy.array(
-                        rng.randn(*x.shape).astype(np.float32)),
+                        np.array(rng.randn(*x.shape), dtype=x.dtype)),
                     best_params)
                 opt_state = optimizer.init(opt_params)
             if nan_count > 3:

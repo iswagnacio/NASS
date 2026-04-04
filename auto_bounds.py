@@ -174,8 +174,10 @@ Use them to set appropriate parameter bounds in your param_config.
   models, eNa is typically 30-90 mV ABOVE the spike peak because Na channels
   inactivate before V reaches eNa. Typical range: 50-115 mV.
 - eK MUST be below AHP trough ({features['ahp_trough_p10_mV']} mV). Typical range: -120 to -70 mV.
-- Leak_eLeak should be near resting potential ({features['resting_potential_mV']} mV) but can
-  differ ±20 mV due to active channels at rest.
+- **Leak_eLeak MUST be near resting potential ({features['resting_potential_mV']} mV)**.
+  Set init={features['resting_potential_mV']}, bounds=[{features['resting_potential_mV']-10:.0f}, {features['resting_potential_mV']+10:.0f}].
+  The optimizer penalizes pre-stimulus baseline mismatch heavily -- a 12 mV
+  Vrest offset causes R2=0 on held-out sweeps. DO NOT use wide bounds like [-85, -50].
 - Na_gNa init MUST be >= 0.10 S/cm² for single-compartment models to spike.
   Below this, Kv3 suppresses all spiking and gradients are NaN.
 - {'This is a FAST-SPIKING cell (narrow spikes, high rate). Use Kv3, prefer small radius (5-12 µm), keep capacitance ≤ 2.0.' if is_fs else 'This appears to be a regular-spiking or adapting cell. Consider IM/IAHP for adaptation.'}"""

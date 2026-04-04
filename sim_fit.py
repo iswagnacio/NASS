@@ -29,7 +29,7 @@ Output:
 
 # ---- JAX config must come before any JAX imports ----
 from jax import config
-config.update("jax_enable_x64", False)
+config.update("jax_enable_x64", True)
 
 import os
 import json
@@ -344,16 +344,33 @@ def load_multiple_sweeps(ctc: CellTypesCache, specimen_id: int,
                 selected_numbers.add(choice["sweep_number"])
 
         # Fill remaining slots if n_sweeps > 3
+        # IMPORTANT: never duplicate sweeps — each sweep_number appears at most once
         if len(selected) < n_sweeps:
-            remaining = [sw for sw in spiking
-                         if sw["sweep_number"] not in selected_numbers]
-            # Spread evenly across remaining spiking sweeps
-            if remaining:
-                n_extra = n_sweeps - len(selected)
-                indices = np.linspace(0, len(remaining) - 1, n_extra, dtype=int)
-                for i in indices:
-                    selected.append(remaining[i])
-                    selected_numbers.add(remaining[i]["sweep_number"])
+            # First: add remaining spiking sweeps (most informative)
+            remaining_spiking = [sw for sw in spiking
+                                 if sw["sweep_number"] not in selected_numbers]
+            if remaining_spiking:
+                n_extra = min(n_sweeps - len(selected), len(remaining_spiking))
+                indices = np.linspace(0, len(remaining_spiking) - 1, n_extra, dtype=int)
+                for i in np.unique(indices):  # unique to avoid any rounding duplicates
+                    selected.append(remaining_spiking[i])
+                    selected_numbers.add(remaining_spiking[i]["sweep_number"])
+
+        if len(selected) < n_sweeps:
+            # Second: add non-spiking sweeps spread across the amplitude range
+            # These constrain the subthreshold behavior and F-I curve floor
+            remaining_all = [sw for sw in by_amp
+                             if sw["sweep_number"] not in selected_numbers]
+            if remaining_all:
+                n_extra = min(n_sweeps - len(selected), len(remaining_all))
+                indices = np.linspace(0, len(remaining_all) - 1, n_extra, dtype=int)
+                for i in np.unique(indices):
+                    selected.append(remaining_all[i])
+                    selected_numbers.add(remaining_all[i]["sweep_number"])
+
+        if len(selected) < n_sweeps:
+            logger.warning(f"  Requested {n_sweeps} sweeps but only "
+                           f"{len(selected)} unique training sweeps available")
 
     else:
         # No spiking sweeps — fall back to evenly spaced by amplitude
@@ -365,6 +382,17 @@ def load_multiple_sweeps(ctc: CellTypesCache, specimen_id: int,
 
     # Sort by amplitude for consistent ordering
     selected.sort(key=lambda s: s.get("stimulus_amplitude", 0) or 0)
+
+    # Safety: deduplicate by sweep_number (should never trigger after above fix)
+    seen = set()
+    deduped = []
+    for sw in selected:
+        if sw["sweep_number"] not in seen:
+            seen.add(sw["sweep_number"])
+            deduped.append(sw)
+    if len(deduped) < len(selected):
+        logger.warning(f"  Removed {len(selected) - len(deduped)} duplicate sweeps")
+    selected = deduped
 
     # Load sweep data from NWB
     data_set = ctc.get_ephys_data(specimen_id)

@@ -49,7 +49,7 @@ Requires:
 
 # ---- JAX config before any JAX imports ----
 from jax import config
-config.update("jax_enable_x64", False)
+config.update("jax_enable_x64", True)
 
 import json
 import csv

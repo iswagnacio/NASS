@@ -140,6 +140,18 @@ class DiagnosticReport:
             f"- Simulated spikes: {self.n_sim_spikes}, Target spikes: {self.n_target_spikes}",
         ]
 
+        # Vrest diagnostics
+        p_diag = p.diagnostics if isinstance(p.diagnostics, dict) else {}
+        sub_r2 = p_diag.get("subthreshold_r2", None)
+        vrest_mismatch = p_diag.get("vrest_mismatch_mV", None)
+        vrest_sim = p_diag.get("vrest_sim_mV", None)
+        vrest_target = p_diag.get("vrest_target_mV", None)
+        if sub_r2 is not None:
+            lines.append(f"- Subthreshold R2: {sub_r2:.3f}")
+        if vrest_mismatch is not None and vrest_sim is not None:
+            lines.append(f"- Vrest mismatch: {vrest_mismatch:+.1f} mV "
+                         f"(model={vrest_sim:.1f}, target={vrest_target:.1f})")
+
         if p.fitted_params:
             lines.append("\n## Fitted Parameters (final values):")
             for k, v in p.fitted_params.items():
@@ -243,6 +255,33 @@ class DiagnosticReport:
                 
         if not any([self.no_spikes, self.wrong_firing_rate, self.broad_spikes, self.excessive_sag]):
             lines.append("- No major structural issues detected.")
+
+        # eLeak / Vrest mismatch feedback
+        if vrest_mismatch is not None and abs(vrest_mismatch) > 5.0:
+            direction = "too hyperpolarized" if vrest_mismatch < 0 else "too depolarized"
+            consequence = "overfiring" if vrest_mismatch > 0 else "underfiring"
+            lines.append(
+                f"\n- **RESTING POTENTIAL MISMATCH ({abs(vrest_mismatch):.1f} mV)**: "
+                f"Model baseline is {direction} vs target. This causes {consequence} "
+                f"on held-out sweeps and subthreshold R2=0.")
+
+            eleak_val = p.fitted_params.get("Leak_eLeak", None)
+            if "Leak_eLeak=lower" in self.parameters_at_bounds and vrest_mismatch < 0:
+                lines.append(
+                    f"  -> Leak_eLeak HIT LOWER BOUND ({eleak_val:.1f} mV) "
+                    f"and model is too hyperpolarized. "
+                    f"RAISE Leak_eLeak lower bound by >={abs(vrest_mismatch):.0f} mV. "
+                    f"Set init closer to target Vrest ({vrest_target:.1f} mV).")
+            elif "Leak_eLeak=upper" in self.parameters_at_bounds and vrest_mismatch > 0:
+                lines.append(
+                    f"  -> Leak_eLeak HIT UPPER BOUND ({eleak_val:.1f} mV) "
+                    f"and model is too depolarized. "
+                    f"LOWER Leak_eLeak upper bound by >={abs(vrest_mismatch):.0f} mV.")
+            elif eleak_val is not None:
+                lines.append(
+                    f"  -> Leak_eLeak={eleak_val:.1f} mV (not at bound). "
+                    f"Check if other channels at rest are shifting baseline. "
+                    f"Verify Leak_gLeak is large enough to anchor Vrest.")
 
         return "\n".join(lines)
 

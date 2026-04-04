@@ -1,305 +1,400 @@
 """
-Multi-Sweep Fitting Extension for general_fit.py
-=================================================
+Multi-Sweep Fitting Module for NASS
+====================================
 
-KEY DESIGN: Each sweep gets its own pre-stimulated cell clone built at
-loss-construction time. The loss function sets the same parameters on
-all cells via param_state, runs jx.integrate on each independently,
-and averages the per-sweep losses.
+Provides the multi-sweep loss functions and data loading that general_fit.py
+imports when n_sweeps > 1.
 
-This avoids calling cell.delete_stimuli()/cell.stimulate() inside the
-JIT-compiled loss function. Those are Python side effects that modify
-cell.externals in place, corrupting JAX's traced computation graph and
-causing NaN gradients on every call after the first JIT trace.
+Architecture:
+    - All sweeps are padded/windowed to the SAME length (required for JIT)
+    - Each sweep gets its own target trace, spike count, and loss components
+    - Per-sweep data_stimuli are PRE-BUILT outside the loss function (eager mode)
+      and captured as closure constants — this avoids calling cell.data_stimulate()
+      inside JIT-traced code, which causes NaN gradients due to cell side effects
+    - Per-sweep losses are summed with optional weighting by spike count
+      (sweeps with more spikes contribute more to the total loss)
+
+Key Jaxley API:
+    cell.stimulate(current)        — static, NOT JIT-compatible
+    cell.data_stimulate(current, data_stimuli)  — builds data_stimuli dict (has cell side effects)
+    jx.integrate(cell, param_state=..., data_stimuli=...)  — JIT/grad-compatible
+
+CRITICAL: cell.data_stimulate() modifies internal cell state (externals indexing).
+Calling it inside a JIT-traced function causes accumulated side effects that
+corrupt the computation graph, producing NaN gradients on backward pass.
+The fix: call data_stimulate() ONCE per sweep during setup (eager mode),
+then reference the pre-built data_stimuli inside the loss function.
 """
 
 import logging
 import numpy as np
 import jax
 import jax.numpy as jnp
+
 import jaxley as jx
+
+from sim_fit import (
+    load_multiple_sweeps,
+    prepare_stimulus,
+    prepare_target,
+)
+
+from general_fit import (
+    _build_shared_loss_components,
+    extract_baseline,
+    window_to_main_stimulus,
+)
 
 logger = logging.getLogger(__name__)
 
 
 # ===========================================================================
-# Multi-Sweep Data Loading
+# Data Loading & Preparation
 # ===========================================================================
 
 def load_and_prepare_sweeps(ctc, specimen_id, sweep_index, dt=0.025,
                             max_duration_ms=1200.0, n_sweeps=3):
     """
-    Load and prepare multiple training sweeps for multi-sweep fitting.
+    Load multiple sweeps and prepare them for multi-sweep fitting.
+
+    All sweeps are windowed to the stimulus epoch and then padded/truncated
+    to the SAME length (the maximum across sweeps). This is required because
+    JAX JIT recompiles for different array shapes.
+
+    Returns a list of dicts, each containing:
+        - stimulus: jnp array (n_steps,)
+        - target_v: jnp array (n_steps,)
+        - baseline_v: np array
+        - t_max: float
+        - sweep_number: int
+        - stimulus_amplitude: float
+        - shared: dict from _build_shared_loss_components()
     """
-    from sim_fit import load_multiple_sweeps, load_training_sweep
-    from sim_fit import prepare_stimulus, prepare_target
+    raw_sweeps = load_multiple_sweeps(ctc, specimen_id, sweep_index,
+                                      n_sweeps=n_sweeps)
 
-    if n_sweeps <= 1:
-        sweep = load_training_sweep(ctc, specimen_id, sweep_index)
-        raw_sweeps = [sweep]
-    else:
-        raw_sweeps = load_multiple_sweeps(ctc, specimen_id, sweep_index,
-                                          n_sweeps=n_sweeps)
-
-    from general_fit import (extract_baseline, window_to_main_stimulus,
-                             _build_shared_loss_components)
-
+    # Prepare each sweep: resample, extract baseline, window
     prepared = []
-    for i, sweep in enumerate(raw_sweeps):
-        stimulus, t_max = prepare_stimulus(sweep, dt)
+    for sweep in raw_sweeps:
+        stim, t_max = prepare_stimulus(sweep, dt)
         target_v = prepare_target(sweep, dt)
 
-        baseline_v = extract_baseline(stimulus, target_v, dt)
+        # Extract baseline from pre-stimulus period of FULL trace
+        baseline_v = extract_baseline(stim, target_v, dt)
 
-        target_v_jnp = jnp.array(target_v)
-        stimulus_w, target_w, t_max_w = window_to_main_stimulus(
-            stimulus, target_v_jnp, dt, max_duration_ms)
-
-        shared = _build_shared_loss_components(target_w, dt)
-
-        amp = sweep.get("stimulus_amplitude", 0) or 0
-        n_spk = sweep.get("num_spikes", shared.get("raw_target_spike_count", 0))
-
-        logger.info(f"  Sweep {i+1}/{len(raw_sweeps)}: "
-                    f"#{sweep['sweep_number']} ({amp:.0f} pA, "
-                    f"{int(shared.get('raw_target_spike_count', 0))} spikes, "
-                    f"{len(stimulus_w)} steps)")
+        # Window to stimulus epoch
+        stim_win, target_win, t_max_win = window_to_main_stimulus(
+            stim, jnp.array(target_v), dt, max_duration_ms)
 
         prepared.append({
-            "stimulus": stimulus_w,
-            "target_v": target_w,
+            "stimulus": np.array(stim_win),
+            "target_v_np": np.array(target_win),
             "baseline_v": baseline_v,
+            "t_max": t_max_win,
             "sweep_number": sweep["sweep_number"],
-            "stimulus_amplitude": amp,
-            "num_spikes": n_spk,
-            "shared": shared,
-            "t_max": t_max_w,
+            "stimulus_amplitude": sweep.get("stimulus_amplitude", 0.0),
+            "num_spikes": sweep.get("num_spikes", 0),
         })
 
-    return prepared
+    # Pad all sweeps to the same length (max across sweeps)
+    max_len = max(len(p["stimulus"]) for p in prepared)
+    logger.info(f"  Multi-sweep: padding all sweeps to {max_len} steps "
+                f"({max_len * dt:.0f} ms)")
+
+    result = []
+    for p in prepared:
+        n = len(p["stimulus"])
+        if n < max_len:
+            # Pad stimulus with zeros (no current), target with last value
+            stim_padded = np.zeros(max_len, dtype=np.float64)
+            stim_padded[:n] = p["stimulus"]
+
+            target_padded = np.full(max_len, p["target_v_np"][-1],
+                                    dtype=np.float64)
+            target_padded[:n] = p["target_v_np"]
+        else:
+            stim_padded = p["stimulus"][:max_len]
+            target_padded = p["target_v_np"][:max_len]
+
+        target_v_jnp = jnp.array(target_padded)
+
+        # Build shared loss components for this sweep
+        shared = _build_shared_loss_components(target_v_jnp, dt)
+
+        result.append({
+            "stimulus": jnp.array(stim_padded),
+            "target_v": target_v_jnp,
+            "baseline_v": p["baseline_v"],
+            "t_max": max_len * dt,
+            "sweep_number": p["sweep_number"],
+            "stimulus_amplitude": p["stimulus_amplitude"],
+            "num_spikes": p.get("num_spikes", 0),
+            "shared": shared,
+            "original_len": n,
+        })
+
+    return result
 
 
 # ===========================================================================
-# Build Per-Sweep Cells
+# Pre-build data_stimuli (EAGER mode — outside JIT)
 # ===========================================================================
 
-def build_sweep_cells(proposal, sweep_data_list, dt, adaptive_limits=None):
+def prebuild_data_stimuli(cell, sweep_data_list):
     """
-    Build one pre-stimulated cell per sweep for multi-sweep fitting.
+    Pre-build Jaxley data_stimuli dicts for each sweep in EAGER mode.
 
-    Each cell is an independent clone with the same channel composition
-    and geometry, but stimulated with a different sweep's waveform.
-    All cells share the same trainable parameter names.
+    CRITICAL: cell.data_stimulate() has side effects on cell internals
+    (e.g. appending to external stimulus indexing structures). Calling it
+    inside a JIT-traced loss function causes these side effects to accumulate
+    during tracing, corrupting the computation graph and producing NaN
+    gradients on the backward pass.
 
-    Returns:
-        cells: list of jx.Compartment (one per sweep, each pre-stimulated
-               and with trainable parameters registered)
-        trainable: list of trainable param dicts (from first cell build)
-        param_names: list of parameter name strings
-        opt_params: initial optimizer parameters (from first cell)
+    By calling data_stimulate() here (once per sweep, eagerly), we get
+    pure JAX data structures (dicts of arrays) that can be safely captured
+    in the loss function closure and used under JIT/grad.
+
+    Returns a list of data_stimuli dicts, one per sweep.
     """
-    from general_fit import build_cell_from_proposal
-    from sim_fit import setup_simulation
-    from jaxley.optimize.transforms import ParamTransform, SigmoidTransform
+    result = []
+    for si, sd in enumerate(sweep_data_list):
+        stim = sd["stimulus"]
+        data_stimuli = None
+        data_stimuli = cell.data_stimulate(stim, data_stimuli)
+        result.append(data_stimuli)
 
-    cells = []
-    trainable = None
+    logger.info(f"  Pre-built data_stimuli for {len(result)} sweeps "
+                f"(eager mode, outside JIT)")
+    return result
+
+
+# ===========================================================================
+# Multi-Sweep Loss Functions
+# ===========================================================================
+
+def _single_sweep_phase1_loss(v_sim, target_v, shared,
+                               mse_weight=0.1, stats_weight=5.0,
+                               spike_count_weight=300.0,
+                               baseline_weight=50.0):
+    """
+    Compute Phase 1 loss for a single sweep (no timing).
+    Pure JAX — no side effects, fully differentiable.
+    """
+    # Use Python min(), NOT jnp.minimum() — len() returns static ints,
+    # but jnp.minimum returns a traced JAX scalar that can't be used
+    # as a slice index under JIT (causes IndexError on v_sim[:n]).
+    n = min(len(v_sim), len(target_v))
+    v_s = v_sim[:n]
+    v_t = target_v[:n]
+
+    # MSE
+    mse = jnp.mean((v_s - v_t) ** 2)
+
+    # Windowed stats
+    n_windows = shared["n_windows"]
+    win_size = shared["win_size"]
+    tgt_means = shared["tgt_means"]
+    tgt_stds = shared["tgt_stds"]
+    mean_scale = shared["mean_scale"]
+    std_scale = shared["std_scale"]
+
+    sim_means = []
+    sim_stds = []
+    for w in range(n_windows):
+        start = w * win_size
+        end = start + win_size if w < n_windows - 1 else n
+        win = v_s[start:end]
+        sim_means.append(jnp.mean(win))
+        sim_stds.append(jnp.std(win))
+    sim_means = jnp.stack(sim_means)
+    sim_stds = jnp.stack(sim_stds)
+
+    stats_loss = (jnp.mean(jnp.abs(sim_means / mean_scale - tgt_means / mean_scale))
+                  + jnp.mean(jnp.abs(sim_stds / std_scale - tgt_stds / std_scale)))
+
+    # Soft spike count
+    spike_k = shared["spike_k"]
+    spike_threshold = shared["spike_threshold"]
+    target_spike_count = shared["target_spike_count"]
+
+    p = jax.nn.sigmoid(spike_k * (v_s - spike_threshold))
+    dp = jnp.diff(p)
+    soft_events = jax.nn.relu(dp)
+    soft_count = jnp.sum(soft_events)
+    spike_loss = (soft_count / target_spike_count - 1.0) ** 2
+
+    # Baseline Vrest loss
+    n_baseline = shared["n_baseline_est"]
+    baseline_loss = jnp.mean((v_s[:n_baseline] - v_t[:n_baseline]) ** 2)
+
+    return (mse_weight * mse + stats_weight * stats_loss
+            + spike_count_weight * spike_loss
+            + baseline_weight * baseline_loss)
+
+
+def _single_sweep_phase2_loss(v_sim, target_v, shared,
+                               mse_weight=0.1, stats_weight=5.0,
+                               spike_count_weight=300.0,
+                               spike_timing_weight=100.0):
+    """
+    Compute Phase 2 loss for a single sweep (with timing).
+    """
+    # Phase 1 components
+    p1 = _single_sweep_phase1_loss(v_sim, target_v, shared,
+                                    mse_weight, stats_weight,
+                                    spike_count_weight)
+
+    # Timing loss — use Python min() for static slice index (same as phase1)
+    n = min(len(v_sim), len(target_v))
+    v_s = v_sim[:n]
+    spike_k = shared["spike_k"]
+    spike_threshold = shared["spike_threshold"]
+    timing_kernel = shared["timing_kernel"]
+    tgt_smoothed = shared["tgt_smoothed"]
+
+    p = jax.nn.sigmoid(spike_k * (v_s - spike_threshold))
+    dp = jnp.diff(p)
+    soft_events = jax.nn.relu(dp)
+
+    sim_smoothed = jnp.convolve(soft_events, timing_kernel, mode='same')
+    sim_smoothed = sim_smoothed / jnp.maximum(jnp.max(sim_smoothed), 1e-8)
+    n_t = min(len(sim_smoothed), len(tgt_smoothed))
+    timing_loss = jnp.mean((sim_smoothed[:n_t] - tgt_smoothed[:n_t]) ** 2)
+
+    return p1 + spike_timing_weight * timing_loss
+
+
+def _build_multisweep_phase1_loss_fn(cell, sweep_data_list, dt,
+                                      transform, param_names,
+                                      mse_weight=0.1, stats_weight=5.0,
+                                      spike_count_weight=300.0,
+                                      pre_data_stimuli=None):
+    """
+    Build a Phase 1 multi-sweep loss function.
+
+    The loss is the weighted sum of per-sweep losses. Sweeps with more
+    target spikes get proportionally higher weight (they carry more
+    information about the model's firing behavior).
+
+    CRITICAL: pre_data_stimuli must be provided — these are the data_stimuli
+    dicts pre-built by prebuild_data_stimuli() in eager mode. The loss
+    function references them as closure constants, avoiding any
+    cell.data_stimulate() calls inside JIT-traced code.
+    """
+    # Pre-compute per-sweep weights based on spike count
+    spike_counts = [sd["shared"]["raw_target_spike_count"] for sd in sweep_data_list]
+    total_spikes = max(sum(spike_counts), 1)
+    # Weight = spike_count / total, with a floor of 0.1 for sub-threshold sweeps
+    weights = [max(sc / total_spikes, 0.1) for sc in spike_counts]
+    weight_sum = sum(weights)
+    weights = [w / weight_sum for w in weights]  # normalize to sum=1
+
+    # Pre-extract JAX arrays for each sweep
+    targets = [sd["target_v"] for sd in sweep_data_list]
+    shareds = [sd["shared"] for sd in sweep_data_list]
+
+    n_sweeps = len(sweep_data_list)
+
+    # Pre-build data_stimuli if not provided (backward compat, but warn)
+    if pre_data_stimuli is None:
+        logger.warning("  pre_data_stimuli not provided — building inside "
+                       "factory (may cause NaN gradients under JIT)")
+        pre_data_stimuli = []
+        for sd in sweep_data_list:
+            ds = None
+            ds = cell.data_stimulate(sd["stimulus"], ds)
+            pre_data_stimuli.append(ds)
 
     for i, sd in enumerate(sweep_data_list):
-        cell, t, error = build_cell_from_proposal(proposal,
-                                                   adaptive_limits=adaptive_limits)
-        if error:
-            raise ValueError(f"Cell construction failed for sweep {i}: {error}")
-
-        cell = setup_simulation(cell, sd["stimulus"], dt, sd["t_max"])
-
-        if trainable is None:
-            trainable = t
-
-        # Make parameters trainable on each cell
-        for t_info in trainable:
-            cell.make_trainable(t_info["name"])
-
-        cells.append(cell)
-
-    # Get opt_params and build transform from first cell
-    opt_params = cells[0].get_parameters()
-    param_names = [t["name"] for t in trainable]
-
-    transforms = []
-    for t_info in trainable:
-        bound_range = t_info["upper"] - t_info["lower"]
-        buffer = bound_range * 0.001
-        transforms.append({
-            t_info["name"]: SigmoidTransform(
-                lower=t_info["lower"] - buffer,
-                upper=t_info["upper"] + buffer,
-            )
-        })
-    transform = ParamTransform(transforms)
-
-    return cells, trainable, param_names, opt_params, transform
-
-
-# ===========================================================================
-# Multi-Sweep Loss Builders
-# ===========================================================================
-
-def _build_multisweep_phase1_loss_fn(cells, sweep_data_list, dt, transform,
-                                      param_names, mse_weight=0.1,
-                                      stats_weight=5.0,
-                                      spike_count_weight=300.0):
-    """
-    Phase 1 multi-sweep loss: average of per-sweep (spike_count + stats + MSE).
-
-    Each sweep has its own pre-stimulated cell. No side effects inside
-    the loss function — just param_state setting and jx.integrate calls.
-    """
-    n_sweeps = len(sweep_data_list)
-    sweep_targets = [sd["target_v"] for sd in sweep_data_list]
-    sweep_shareds = [sd["shared"] for sd in sweep_data_list]
+        tc = int(sd["shared"].get("raw_target_spike_count", 0))
+        logger.info(f"    Sweep #{sd['sweep_number']}: weight={weights[i]:.2f}, "
+                    f"target_spikes={tc}")
 
     def loss_fn(opt_params):
+        # Set parameters once
         params = transform.forward(opt_params)
+        param_state = None
+        for i, name in enumerate(param_names):
+            param_state = cell.data_set(name, params[i][name], param_state)
 
         total_loss = jnp.array(0.0)
 
         for sw_idx in range(n_sweeps):
-            cell = cells[sw_idx]
-            target_v = sweep_targets[sw_idx]
-            shared = sweep_shareds[sw_idx]
+            # Use PRE-BUILT data_stimuli — no cell.data_stimulate() here!
+            # This is the critical fix: data_stimulate() has cell side effects
+            # that corrupt the computation graph under JIT tracing.
+            v = jx.integrate(cell, param_state=param_state,
+                             data_stimuli=pre_data_stimuli[sw_idx],
+                             delta_t=dt)
+            v_sim = v[0]
 
-            param_state = None
-            for i, name in enumerate(param_names):
-                param_state = cell.data_set(name, params[i][name], param_state)
+            # Compute per-sweep loss
+            sw_loss = _single_sweep_phase1_loss(
+                v_sim, targets[sw_idx], shareds[sw_idx],
+                mse_weight, stats_weight, spike_count_weight)
 
-            try:
-                v = jx.integrate(cell, param_state=param_state, delta_t=dt)
-                v_sim = v[0]
-                n = min(len(v_sim), len(target_v))
-                v_s, v_t = v_sim[:n], target_v[:n]
+            total_loss = total_loss + weights[sw_idx] * sw_loss
 
-                mse = jnp.mean((v_s - v_t) ** 2)
-
-                n_windows = shared["n_windows"]
-                win_size = shared["win_size"]
-                sim_means, sim_stds = [], []
-                for w in range(n_windows):
-                    start = w * win_size
-                    end = start + win_size if w < n_windows - 1 else n
-                    win = v_s[start:end]
-                    sim_means.append(jnp.mean(win))
-                    sim_stds.append(jnp.std(win))
-                sim_means = jnp.stack(sim_means)
-                sim_stds = jnp.stack(sim_stds)
-                stats_loss = (
-                    jnp.mean(jnp.abs(sim_means / shared["mean_scale"]
-                                      - shared["tgt_means"] / shared["mean_scale"]))
-                    + jnp.mean(jnp.abs(sim_stds / shared["std_scale"]
-                                        - shared["tgt_stds"] / shared["std_scale"]))
-                )
-
-                spike_k = shared["spike_k"]
-                spike_threshold = shared["spike_threshold"]
-                target_spike_count = shared["target_spike_count"]
-                p = jax.nn.sigmoid(spike_k * (v_s - spike_threshold))
-                dp = jnp.diff(p)
-                soft_events = jax.nn.relu(dp)
-                soft_count = jnp.sum(soft_events)
-                spike_loss = (soft_count / target_spike_count - 1.0) ** 2
-
-                sweep_loss = (mse_weight * mse
-                              + stats_weight * stats_loss
-                              + spike_count_weight * spike_loss)
-            except Exception:
-                sweep_loss = jnp.array(float("inf"))
-
-            total_loss = total_loss + sweep_loss
-
-        return total_loss / n_sweeps
+        return total_loss
 
     return loss_fn
 
 
-def _build_multisweep_phase2_loss_fn(cells, sweep_data_list, dt, transform,
-                                      param_names, mse_weight=0.1,
-                                      stats_weight=5.0,
+def _build_multisweep_phase2_loss_fn(cell, sweep_data_list, dt,
+                                      transform, param_names,
+                                      mse_weight=0.1, stats_weight=5.0,
                                       spike_count_weight=300.0,
-                                      spike_timing_weight=100.0):
+                                      spike_timing_weight=100.0,
+                                      pre_data_stimuli=None):
     """
-    Phase 2 multi-sweep loss: average of per-sweep full loss (+ spike timing).
+    Build a Phase 2 multi-sweep loss function (with timing).
+
+    CRITICAL: pre_data_stimuli must be provided — see Phase 1 docstring.
     """
+    spike_counts = [sd["shared"]["raw_target_spike_count"] for sd in sweep_data_list]
+    total_spikes = max(sum(spike_counts), 1)
+    weights = [max(sc / total_spikes, 0.1) for sc in spike_counts]
+    weight_sum = sum(weights)
+    weights = [w / weight_sum for w in weights]
+
+    targets = [sd["target_v"] for sd in sweep_data_list]
+    shareds = [sd["shared"] for sd in sweep_data_list]
+
     n_sweeps = len(sweep_data_list)
-    sweep_targets = [sd["target_v"] for sd in sweep_data_list]
-    sweep_shareds = [sd["shared"] for sd in sweep_data_list]
+
+    # Pre-build data_stimuli if not provided (backward compat, but warn)
+    if pre_data_stimuli is None:
+        logger.warning("  pre_data_stimuli not provided — building inside "
+                       "factory (may cause NaN gradients under JIT)")
+        pre_data_stimuli = []
+        for sd in sweep_data_list:
+            ds = None
+            ds = cell.data_stimulate(sd["stimulus"], ds)
+            pre_data_stimuli.append(ds)
 
     def loss_fn(opt_params):
         params = transform.forward(opt_params)
+        param_state = None
+        for i, name in enumerate(param_names):
+            param_state = cell.data_set(name, params[i][name], param_state)
 
         total_loss = jnp.array(0.0)
 
         for sw_idx in range(n_sweeps):
-            cell = cells[sw_idx]
-            target_v = sweep_targets[sw_idx]
-            shared = sweep_shareds[sw_idx]
+            # Use PRE-BUILT data_stimuli — no cell.data_stimulate() here!
+            v = jx.integrate(cell, param_state=param_state,
+                             data_stimuli=pre_data_stimuli[sw_idx],
+                             delta_t=dt)
+            v_sim = v[0]
 
-            param_state = None
-            for i, name in enumerate(param_names):
-                param_state = cell.data_set(name, params[i][name], param_state)
+            sw_loss = _single_sweep_phase2_loss(
+                v_sim, targets[sw_idx], shareds[sw_idx],
+                mse_weight, stats_weight, spike_count_weight,
+                spike_timing_weight)
 
-            try:
-                v = jx.integrate(cell, param_state=param_state, delta_t=dt)
-                v_sim = v[0]
-                n = min(len(v_sim), len(target_v))
-                v_s, v_t = v_sim[:n], target_v[:n]
+            total_loss = total_loss + weights[sw_idx] * sw_loss
 
-                mse = jnp.mean((v_s - v_t) ** 2)
-
-                n_windows = shared["n_windows"]
-                win_size = shared["win_size"]
-                sim_means, sim_stds = [], []
-                for w in range(n_windows):
-                    start = w * win_size
-                    end = start + win_size if w < n_windows - 1 else n
-                    win = v_s[start:end]
-                    sim_means.append(jnp.mean(win))
-                    sim_stds.append(jnp.std(win))
-                sim_means = jnp.stack(sim_means)
-                sim_stds = jnp.stack(sim_stds)
-                stats_loss = (
-                    jnp.mean(jnp.abs(sim_means / shared["mean_scale"]
-                                      - shared["tgt_means"] / shared["mean_scale"]))
-                    + jnp.mean(jnp.abs(sim_stds / shared["std_scale"]
-                                        - shared["tgt_stds"] / shared["std_scale"]))
-                )
-
-                spike_k = shared["spike_k"]
-                spike_threshold = shared["spike_threshold"]
-                target_spike_count = shared["target_spike_count"]
-                p = jax.nn.sigmoid(spike_k * (v_s - spike_threshold))
-                dp = jnp.diff(p)
-                soft_events = jax.nn.relu(dp)
-                soft_count = jnp.sum(soft_events)
-                spike_loss = (soft_count / target_spike_count - 1.0) ** 2
-
-                timing_kernel = shared["timing_kernel"]
-                tgt_smoothed = shared["tgt_smoothed"]
-                sim_smoothed = jnp.convolve(soft_events, timing_kernel, mode='same')
-                sim_smoothed = sim_smoothed / jnp.maximum(jnp.max(sim_smoothed), 1e-8)
-                n_t = min(len(sim_smoothed), len(tgt_smoothed))
-                timing_loss = jnp.mean(
-                    (sim_smoothed[:n_t] - tgt_smoothed[:n_t]) ** 2)
-
-                sweep_loss = (mse_weight * mse
-                              + stats_weight * stats_loss
-                              + spike_count_weight * spike_loss
-                              + spike_timing_weight * timing_loss)
-            except Exception:
-                sweep_loss = jnp.array(float("inf"))
-
-            total_loss = total_loss + sweep_loss
-
-        return total_loss / n_sweeps
+        return total_loss
 
     return loss_fn
 
@@ -308,98 +403,92 @@ def _build_multisweep_phase2_loss_fn(cells, sweep_data_list, dt, transform,
 # Multi-Sweep Diagnostics
 # ===========================================================================
 
-def compute_multisweep_diagnostics(cell, sweep_data_list, dt, transform,
-                                    param_names, fitted_params_raw,
-                                    proposal, trainable, best_loss):
+def compute_multisweep_diagnostics(cell, sweep_data_list, dt,
+                                    transform, param_names,
+                                    best_params, proposal, trainable,
+                                    best_loss):
     """
-    Run final simulation on all sweeps and aggregate diagnostics.
+    Run final simulation on each sweep and aggregate diagnostics.
 
-    Uses a fresh cell for each sweep to avoid JAX tracer leaks.
+    Returns a dict compatible with general_fit.compute_diagnostics() output.
+    Reports primary sweep (most spikes) stats for backward compatibility,
+    plus per-sweep breakdown.
+
+    NOTE: This runs in eager mode (not JIT), so data_stimulate() is safe here.
     """
-    from sim_fit import setup_simulation
-    from general_fit import build_cell_from_proposal
+    fitted = transform.forward(best_params)
 
-    fitted = transform.forward(fitted_params_raw)
-    fitted_dict = {}
+    # Set params once
+    param_state = None
     for i, name in enumerate(param_names):
-        val = fitted[i][name]
-        fitted_dict[name] = (float(np.array(val).flatten()[0])
-                             if hasattr(val, 'shape') else float(val))
+        param_state = cell.data_set(name, fitted[i][name], param_state)
 
     per_sweep = []
+    spike_threshold = -20.0
 
-    for sw_data in sweep_data_list:
+    for sd in sweep_data_list:
         try:
-            fresh_cell, _, _ = build_cell_from_proposal(proposal)
-            fresh_cell = setup_simulation(
-                fresh_cell, sw_data["stimulus"], dt, sw_data["t_max"])
+            data_stimuli = None
+            data_stimuli = cell.data_stimulate(sd["stimulus"], data_stimuli)
+            v = jx.integrate(cell, param_state=param_state,
+                             data_stimuli=data_stimuli, delta_t=dt)
+            v_sim = np.array(v[0])
 
-            param_state = None
-            for i, name in enumerate(param_names):
-                param_state = fresh_cell.data_set(name, fitted[i][name], param_state)
+            target_np = np.array(sd["target_v"])
+            n = min(len(v_sim), len(target_np))
+            v_sim = v_sim[:n]
+            target_np = target_np[:n]
 
-            v_final = jx.integrate(fresh_cell, param_state=param_state, delta_t=dt)
-            v_sim = np.array(v_final[0])
+            sim_crossings = np.diff((v_sim > spike_threshold).astype(int)) > 0
+            tgt_crossings = np.diff((target_np > spike_threshold).astype(int)) > 0
+            n_sim = int(np.sum(sim_crossings))
+            n_tgt = int(np.sum(tgt_crossings))
+
+            corr = np.corrcoef(v_sim, target_np)[0, 1]
+            if np.isnan(corr):
+                corr = 0.0
+
+            per_sweep.append({
+                "sweep_number": sd["sweep_number"],
+                "stimulus_amplitude": sd["stimulus_amplitude"],
+                "n_sim_spikes": n_sim,
+                "n_target_spikes": n_tgt,
+                "pearson_r": float(corr),
+            })
         except Exception as e:
-            logger.warning(f"    Diagnostic sim failed for sweep "
-                           f"#{sw_data['sweep_number']}: {e}")
-            v_sim = np.zeros(len(np.array(sw_data["target_v"])))
+            logger.warning(f"  Diagnostic sim failed for sweep "
+                           f"#{sd['sweep_number']}: {e}")
+            per_sweep.append({
+                "sweep_number": sd["sweep_number"],
+                "stimulus_amplitude": sd.get("stimulus_amplitude", 0),
+                "n_sim_spikes": 0,
+                "n_target_spikes": sd["shared"].get("raw_target_spike_count", 0),
+                "pearson_r": 0.0,
+            })
 
-        target_np = np.array(sw_data["target_v"])
-        n = min(len(v_sim), len(target_np))
-
-        spike_threshold = -20.0
-        sim_crossings = np.diff((v_sim[:n] > spike_threshold).astype(int)) > 0
-        tgt_crossings = np.diff((target_np[:n] > spike_threshold).astype(int)) > 0
-        n_sim = int(np.sum(sim_crossings))
-        n_tgt = int(np.sum(tgt_crossings))
-
-        corr = float(np.corrcoef(v_sim[:n], target_np[:n])[0, 1])
-        if np.isnan(corr):
-            corr = 0.0
-
-        per_sweep.append({
-            "sweep_number": sw_data["sweep_number"],
-            "stimulus_amplitude": sw_data["stimulus_amplitude"],
-            "n_sim_spikes": n_sim,
-            "n_target_spikes": n_tgt,
-            "pearson_r": corr,
-        })
-
-    primary = per_sweep[0]
-    for ps in per_sweep:
-        if ps["n_target_spikes"] > 0:
-            primary = ps
-            break
-
-    total_sim = sum(ps["n_sim_spikes"] for ps in per_sweep)
-    total_tgt = sum(ps["n_target_spikes"] for ps in per_sweep)
-    mean_r = float(np.mean([ps["pearson_r"] for ps in per_sweep]))
-
-    logger.info(f"  Multi-sweep diagnostics ({len(per_sweep)} sweeps):")
+    # Log per-sweep results
     for ps in per_sweep:
         logger.info(f"    Sweep #{ps['sweep_number']} "
                     f"({ps['stimulus_amplitude']:.0f} pA): "
                     f"{ps['n_sim_spikes']}/{ps['n_target_spikes']} spikes, "
                     f"r={ps['pearson_r']:.3f}")
-    logger.info(f"  Aggregate: {total_sim}/{total_tgt} total spikes, "
-                f"mean_r={mean_r:.3f}")
+
+    # Aggregate: use the primary sweep (most target spikes) for top-level stats
+    primary = max(per_sweep, key=lambda x: x["n_target_spikes"])
+
+    total_sim = sum(ps["n_sim_spikes"] for ps in per_sweep)
+    total_tgt = sum(ps["n_target_spikes"] for ps in per_sweep)
 
     return {
-        "n_sim_spikes": primary["n_sim_spikes"],
-        "n_target_spikes": primary["n_target_spikes"],
+        "final_loss": best_loss,
+        "n_sim_spikes": total_sim,
+        "n_target_spikes": total_tgt,
         "pearson_r": primary["pearson_r"],
-        "model_spikes": primary["n_sim_spikes"] > 0,
-        "no_spikes": (primary["n_target_spikes"] > 0
-                      and primary["n_sim_spikes"] == 0),
-        "wrong_firing_rate": (
-            abs(primary["n_sim_spikes"] - primary["n_target_spikes"])
-            > max(5, primary["n_target_spikes"] * 0.3)
-        ) if primary["n_target_spikes"] > 0 else False,
-        "broad_spikes": False,
+        "model_spikes": total_sim > 0,
+        "no_spikes": total_sim == 0,
+        "wrong_firing_rate": abs(total_sim - total_tgt) > max(5, total_tgt * 0.3),
+        "broad_spikes": False,  # Could compute per-sweep if needed
         "excessive_sag": False,
+        "parameters_at_bounds": [],  # Filled by caller
         "per_sweep": per_sweep,
-        "total_sim_spikes": total_sim,
-        "total_target_spikes": total_tgt,
-        "mean_pearson_r": mean_r,
     }
