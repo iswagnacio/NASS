@@ -154,6 +154,12 @@ def prebuild_data_stimuli(cell, sweep_data_list):
     pure JAX data structures (dicts of arrays) that can be safely captured
     in the loss function closure and used under JIT/grad.
 
+    NOTE: Each call registers one external on the cell. For N sweeps, the
+    cell will have N external registrations. This is expected — each sweep's
+    data_stimuli points to its own registered slot. Do NOT call
+    cell.data_stimulate() again later (e.g. in _count_probe_spikes) or
+    additional registrations will accumulate.
+
     Returns a list of data_stimuli dicts, one per sweep.
     """
     result = []

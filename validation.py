@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 # Channel Resolution (mirrors general_fit.py)
 # ===========================================================================
 
-BUILTIN_CHANNELS = {"Na": Na, "NaCortical": NaCortical, "K": K, "Leak": Leak}
+BUILTIN_CHANNELS = {"Na": NaCortical, "NaCortical": NaCortical, "K": K, "Leak": Leak}
 CUSTOM_CHANNELS = {name: info["class"] for name, info in CHANNEL_REGISTRY.items()}
 ALL_CHANNELS = {**BUILTIN_CHANNELS, **CUSTOM_CHANNELS}
 

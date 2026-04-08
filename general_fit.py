@@ -69,7 +69,14 @@ logger = logging.getLogger(__name__)
 # Channel Resolution
 # ===========================================================================
 
-BUILTIN_CHANNELS = {"Na": Na, "NaCortical": NaCortical, "K": K, "Leak": Leak}
+# IMPORTANT: "Na" maps to NaCortical (cortical fast-recovery Na channel),
+# NOT to Jaxley's built-in squid-axon HH Na. NaCortical uses name="Na"
+# so all param names (Na_gNa, Na_m, Na_h) are identical — drop-in replacement.
+# This is required because standard HH Na inactivation recovery (τ_h ≈ 5-10 ms)
+# cannot support >30 Hz firing regardless of parameter tuning.
+# Cortical Nav1.1/Nav1.6 kinetics (τ_h ≈ 1-2 ms at rest) are essential for
+# PV+ fast-spiking interneurons firing at 50+ Hz.
+BUILTIN_CHANNELS = {"Na": NaCortical, "NaCortical": NaCortical, "K": K, "Leak": Leak}
 CUSTOM_CHANNELS = {name: info["class"] for name, info in CHANNEL_REGISTRY.items()}
 ALL_CHANNELS = {**BUILTIN_CHANNELS, **CUSTOM_CHANNELS}
 
@@ -93,7 +100,8 @@ FALLBACK_PARAM_BOUNDS = {
 DEFAULT_PARAM_BOUNDS = FALLBACK_PARAM_BOUNDS
 
 CHANNEL_CONDUCTANCE_PARAMS = {
-    "Na":   ["Na_gNa"],
+    "Na":          ["Na_gNa"],
+    "NaCortical":  ["Na_gNa"],   # Same params as "Na" (name="Na" in class)
     "K":    ["K_gK"],
     "Leak": ["Leak_gLeak", "Leak_eLeak"],
     "Kv3":  ["Kv3_gKv3"],
@@ -404,7 +412,7 @@ def _build_phase1_loss_fn(cell, target_v, dt, transform, param_names,
 def _build_phase2_loss_fn(cell, target_v, dt, transform, param_names,
                            shared, mse_weight=0.1, stats_weight=5.0,
                            spike_count_weight=300.0,
-                           spike_timing_weight=25.0,
+                           spike_timing_weight=100.0,
                            baseline_weight=50.0):
     """Phase 2 (full) loss: spike_count + spike_timing + windowed_stats + MSE + baseline."""
     n_windows = shared["n_windows"]
@@ -621,6 +629,11 @@ def _apply_init_overrides(opt_params, transform, trainable, overrides):
 def _run_probe(opt_params, optimizer, step_fn, n_probe_epochs):
     """
     Run a short optimization probe. Returns (best_loss, best_params, n_finite).
+
+    CRITICAL: Saves PRE-update params (not post-update) when gradient is finite.
+    The gradient is computed at the pre-update params, so finiteness is only
+    guaranteed there. Saving post-update params can land in a NaN-gradient
+    basin, causing main training to get 100% NaN gradients and stall.
     """
     opt_state = optimizer.init(opt_params)
     best_loss = float("inf")
@@ -633,6 +646,9 @@ def _run_probe(opt_params, optimizer, step_fn, n_probe_epochs):
     first_exception = None
 
     for epoch in range(n_probe_epochs):
+        # Save PRE-update params — gradient finiteness is guaranteed here
+        pre_update_params = jax.tree.map(lambda x: x.copy(), opt_params)
+
         try:
             opt_params, opt_state, loss_val, grad_ok = step_fn(opt_params, opt_state)
             loss_float = float(loss_val)
@@ -660,7 +676,9 @@ def _run_probe(opt_params, optimizer, step_fn, n_probe_epochs):
         n_finite += 1
         if loss_float < best_loss:
             best_loss = loss_float
-            best_params = jax.tree.map(lambda x: x.copy(), opt_params)
+            # Save PRE-update params: the gradient was finite at THESE params,
+            # so main training can start with a guaranteed-finite first step.
+            best_params = pre_update_params
 
     if n_finite == 0 and (n_exception > 0 or n_inf_loss > 0 or n_nan_grad > 0):
         logger.warning(f"      Probe: 0/{min(epoch + 1, n_probe_epochs)} finite — "
@@ -671,7 +689,8 @@ def _run_probe(opt_params, optimizer, step_fn, n_probe_epochs):
 
 
 def _count_probe_spikes(best_params, cell, transform, param_names, dt,
-                        spike_threshold=-20.0, sweep_data_list=None):
+                        spike_threshold=-20.0, sweep_data_list=None,
+                        pre_data_stimuli=None):
     """
     Run one forward simulation with probe's best params and count spikes.
 
@@ -679,9 +698,9 @@ def _count_probe_spikes(best_params, cell, transform, param_names, dt,
     at epoch 40 means the trajectory has crossed the spiking bifurcation,
     which is far more predictive of eventual success than raw loss value.
 
-    In multi-sweep mode (sweep_data_list is not None), the cell's static
-    stimulus is zero — we must inject the primary sweep's stimulus via
-    data_stimulate() or else the simulation sees no current and never spikes.
+    In multi-sweep mode, uses pre_data_stimuli (if provided) to avoid calling
+    cell.data_stimulate() which would accumulate external registrations on the
+    cell and corrupt the computation graph for subsequent training.
 
     Returns n_spikes (int). Returns 0 on any failure.
     """
@@ -696,10 +715,19 @@ def _count_probe_spikes(best_params, cell, transform, param_names, dt,
         if sweep_data_list is not None and len(sweep_data_list) > 0:
             # Multi-sweep mode: cell has zero static stimulus.
             # Use the primary sweep (most target spikes) for spike counting.
-            primary = max(sweep_data_list,
-                          key=lambda sd: sd["shared"].get("raw_target_spike_count", 0))
-            data_stimuli = None
-            data_stimuli = cell.data_stimulate(primary["stimulus"], data_stimuli)
+            primary_idx = max(range(len(sweep_data_list)),
+                              key=lambda i: sweep_data_list[i]["shared"].get(
+                                  "raw_target_spike_count", 0))
+
+            if pre_data_stimuli is not None:
+                # Use pre-built data_stimuli — no cell side effects
+                data_stimuli = pre_data_stimuli[primary_idx]
+            else:
+                # Fallback: must call data_stimulate (adds external to cell)
+                data_stimuli = None
+                data_stimuli = cell.data_stimulate(
+                    sweep_data_list[primary_idx]["stimulus"], data_stimuli)
+
             v = jx.integrate(cell, param_state=param_state,
                              data_stimuli=data_stimuli, delta_t=dt)
         else:
@@ -1049,6 +1077,7 @@ def fit_proposal(
 
     # Step 6: Build phased loss functions
     phase_switch = int(epochs * phase_fraction)
+    pre_data_stimuli = None  # Only set in multi-sweep mode; used by probe scoring
  
     if sweep_data_list is not None and len(sweep_data_list) > 1:
         # Multi-sweep loss
@@ -1082,8 +1111,13 @@ def fit_proposal(
         loss_fn_p1 = _build_multisweep_phase1_loss_fn(
             cell, sweep_data_list, dt, transform, param_names,
             pre_data_stimuli=pre_data_stimuli)
+        loss_fn_p2a = _build_multisweep_phase2_loss_fn(
+            cell, sweep_data_list, dt, transform, param_names,
+            spike_timing_weight=20.0,
+            pre_data_stimuli=pre_data_stimuli)
         loss_fn_p2 = _build_multisweep_phase2_loss_fn(
             cell, sweep_data_list, dt, transform, param_names,
+            spike_timing_weight=100.0,
             pre_data_stimuli=pre_data_stimuli)
 
         # Diagnostic: run one forward pass to verify loss is computable
@@ -1100,10 +1134,12 @@ def fit_proposal(
                     ps = cell.data_set(name, real_p[i][name], ps)
                 for si, sd in enumerate(sweep_data_list):
                     try:
-                        ds = None
-                        ds = cell.data_stimulate(sd["stimulus"], ds)
+                        # Use pre-built data_stimuli — do NOT call
+                        # cell.data_stimulate() here, which would add
+                        # more external registrations to the cell.
                         v_dbg = jx.integrate(cell, param_state=ps,
-                                             data_stimuli=ds, delta_t=dt)
+                                             data_stimuli=pre_data_stimuli[si],
+                                             delta_t=dt)
                         v_np = np.array(v_dbg[0])
                         logger.info(f"    Sweep #{sd['sweep_number']}: "
                                     f"v=[{np.min(v_np):.1f}, {np.max(v_np):.1f}], "
@@ -1121,8 +1157,12 @@ def fit_proposal(
  
         loss_fn_p1 = _build_phase1_loss_fn(cell, target_v_jnp, dt, transform,
                                             param_names, shared)
+        loss_fn_p2a = _build_phase2_loss_fn(cell, target_v_jnp, dt, transform,
+                                             param_names, shared,
+                                             spike_timing_weight=20.0)
         loss_fn_p2 = _build_phase2_loss_fn(cell, target_v_jnp, dt, transform,
-                                            param_names, shared)
+                                            param_names, shared,
+                                            spike_timing_weight=100.0)
 
     # Step 7: Set up optimizer
     n_extra_channels = max(0, len(proposal.channels) - 3)
@@ -1178,6 +1218,23 @@ def fit_proposal(
         new_params = optax.apply_updates(params, updates)
         return new_params, new_opt_state, loss_val, grad_finite
 
+    @jit
+    def step_phase2a(params, opt_state):
+        """Phase 2a: gentle timing weight (20) for gradual onset."""
+        loss_val, grads = value_and_grad(loss_fn_p2a)(params)
+        grad_finite = jax.tree.reduce(
+            lambda a, b: a & b,
+            jax.tree.map(lambda g: jnp.all(jnp.isfinite(g)), grads),
+        )
+        safe_grads = jax.tree.map(
+            lambda g: jnp.where(grad_finite, g, jnp.zeros_like(g)), grads)
+        updates, new_opt_state = optimizer.update(safe_grads, opt_state, params)
+        new_params = optax.apply_updates(params, updates)
+        return new_params, new_opt_state, loss_val, grad_finite
+
+    # Phase 2 warmup: Phase 2a (gentle timing=20) then Phase 2b (full timing=100)
+    phase2b_switch = phase_switch + int((epochs - phase_switch) * 0.4)
+
     # ===================================================================
     # Step 8b: MULTI-START PROBE (NEW)
     # ===================================================================
@@ -1228,9 +1285,12 @@ def fit_proposal(
                 probe_params, probe_optimizer, probe_step, n_probe_epochs)
 
             # Spike-aware scoring: run one forward sim to count spikes
+            # Pass pre_data_stimuli to avoid calling cell.data_stimulate()
+            # which would accumulate external registrations on the cell
             n_spikes = _count_probe_spikes(
                 probe_best, cell, transform, param_names, dt,
-                sweep_data_list=sweep_data_list)
+                sweep_data_list=sweep_data_list,
+                pre_data_stimuli=pre_data_stimuli if sweep_data_list else None)
             score = _score_probe(
                 n_spikes, probe_loss, n_finite, n_probe_epochs,
                 shared["raw_target_spike_count"])
@@ -1284,25 +1344,36 @@ def fit_proposal(
     # ===================================================================
     losses = []
     nan_count, max_nan, nan_grad_count = 0, 15, 0
-    patience, epochs_since_best = 100, 0
+    patience, epochs_since_best = 50, 0
     divergence_threshold = 3.0
     jitter_scale = 0.01
     rng = np.random.RandomState(42)
     current_phase = 1
 
     logger.info(f"  Training: epochs [{effective_start_epoch}, {epochs}), "
-                f"phase_switch at {phase_switch}, lr={lr_effective:.4f}")
+                f"phase_switch at {phase_switch}, "
+                f"phase2b at {phase2b_switch}, lr={lr_effective:.4f}")
 
     for epoch in range(effective_start_epoch, epochs):
-        # Phase switching
-        if epoch >= phase_switch and current_phase == 1:
-            current_phase = 2
-            logger.info(f"  === PHASE SWITCH at epoch {epoch}: "
-                        f"adding spike_timing_weight=100.0 ===")
+        # Phase switching: P1 → P2a (gentle timing) → P2b (full timing)
+        if epoch >= phase2b_switch and current_phase == "2a":
+            current_phase = "2b"
+            logger.info(f"  === PHASE 2b at epoch {epoch}: "
+                        f"spike_timing_weight 20 → 100 ===")
+            # Don't reset best_loss here — P2a and P2b are continuous
+        elif epoch >= phase_switch and current_phase == 1:
+            current_phase = "2a"
+            logger.info(f"  === PHASE 2a at epoch {epoch}: "
+                        f"adding spike_timing_weight=20.0 (gentle) ===")
             best_loss = float("inf")
             epochs_since_best = 0
 
-        step_fn = step_phase1 if current_phase == 1 else step_phase2
+        if current_phase == 1:
+            step_fn = step_phase1
+        elif current_phase == "2a":
+            step_fn = step_phase2a
+        else:
+            step_fn = step_phase2
 
         try:
             opt_params, opt_state, loss_val, grad_ok = step_fn(opt_params, opt_state)
@@ -1342,6 +1413,19 @@ def fit_proposal(
             if nan_grad_count % 10 == 0:
                 logger.info(f"    Epoch {epoch}: NaN gradient (zeroed), "
                             f"total={nan_grad_count}")
+            # NaN gradient recovery: after prolonged NaN streak, perturb
+            # params to escape the NaN basin. Without this, zeroed gradients
+            # produce zero Adam updates, and params never move.
+            if nan_grad_count > 0 and nan_grad_count % 20 == 0 and best_params is not None:
+                perturb_scale = 0.005 * (1.0 + nan_grad_count / 100.0)
+                perturb_scale = min(perturb_scale, 0.05)
+                logger.info(f"    NaN recovery at epoch {epoch}: perturbing params "
+                            f"(scale={perturb_scale:.4f}) after {nan_grad_count} NaN grads")
+                opt_params = jax.tree.map(
+                    lambda x: x + perturb_scale * jax.numpy.array(
+                        np.array(rng.randn(*x.shape), dtype=x.dtype)),
+                    best_params)
+                opt_state = optimizer.init(opt_params)
             continue
 
         losses.append(loss_float)

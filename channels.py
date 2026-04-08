@@ -74,26 +74,35 @@ def _alpha_beta_from_inf_tau(x_inf, tau):
 
 class NaCortical(Channel):
     """
-    Cortical sodium channel optimized for high-frequency firing.
+    Cortical sodium channel optimized for high-frequency firing in PV+
+    fast-spiking interneurons.
 
-    Based on Hodgkin-Huxley Na channel kinetics but with modified h-gate
-    (inactivation) recovery time constant to support PV+ fast-spiking
-    interneuron firing rates (50-200 Hz).
+    Based on Traub & Miles (1991) cortical adaptation of HH kinetics, with
+    ONE critical modification for fast-spiking behavior:
 
-    Key differences from standard HH Na:
-        - h-gate recovery τh reduced by 2-3× at subthreshold voltages
-        - Enables faster recovery from inactivation between spikes
-        - Matches Nav1.1/Nav1.6 cortical isoform properties
+    FAST INACTIVATION RECOVERY: τ_h is 2.5× faster at subthreshold
+    voltages (τ_h ≈ 2-3 ms near Vrest vs 6-8 ms in standard HH).
+    Experimental basis: Nav1.1/Nav1.6 recovery from inactivation has
+    τ ≈ 1 ms at 37°C near -70 mV (Carter & Bean 2009; Raman & Bean 1997).
+    The 2.5× factor is a compromise between biophysical accuracy and
+    gradient stability during BPTT through hundreds of spike crossings.
 
-    Standard HH Na channels (designed for squid giant axon) have τh ≈ 5-10 ms
-    at rest, which limits firing to ~30 Hz. Cortical PV+ interneurons express
-    Nav1.1/Nav1.6 with τh ≈ 1-3 ms, enabling sustained high-frequency firing.
+    The acceleration is voltage-dependent: full 2.5× at subthreshold
+    voltages (V < -50 mV), smoothly ramping to 1× (no acceleration)
+    during spikes (V > -20 mV). This ensures spike upstroke/downstroke
+    kinetics are unchanged, only the inter-spike recovery is faster.
+
+    All other kinetics (m gate, h_inf steady-state) are identical to
+    standard HH. The alpha/beta rates are fully self-consistent,
+    preserving clean gradient flow through BPTT.
 
     I_Na = g_Na * m³ * h * (V - E_Na)
 
-    March 2026: Implemented to solve the bottleneck identified in auto-bounds
-    refactor testing, where standard HH Na kinetics could not produce 48.7 Hz
-    firing even with parameters at gradient safety limits.
+    References:
+        - Traub & Miles (1991) — cortical HH alpha/beta formulation
+        - Carter & Bean (2009) J Neurosci — incomplete inactivation in FS cells
+        - Raman & Bean (1997) Biophys J — fast Na recovery in fast-spiking neurons
+        - Hu & Jonas (2014) Nat Neurosci — supercritical Na density in PV+ axons
     """
 
     def __init__(self, name="Na"):
@@ -115,49 +124,47 @@ class NaCortical(Channel):
         m = states[f"{self._name}_m"]
         h = states[f"{self._name}_h"]
 
-        # ---- Activation gate (m) — standard HH kinetics ----
-        # m_inf and tau_m follow classic Hodgkin-Huxley formulation
-        # Fast activation during spike upstroke
-
-        # Voltage-dependent rates (Traub & Miles 1991 cortical adaptation)
+        # ---- Activation gate (m) — Traub & Miles (1991) cortical formulation ----
         alpha_m = 0.32 * (v + 54.0) / (1.0 - _safe_exp(-(v + 54.0) / 4.0))
         beta_m = 0.28 * (v + 27.0) / (_safe_exp((v + 27.0) / 5.0) - 1.0)
 
-        # Steady-state and time constant
         m_inf = alpha_m / (alpha_m + beta_m)
         tau_m = 1.0 / (alpha_m + beta_m)
-        tau_m = jnp.clip(tau_m, 0.01, 10.0)  # Gradient safety
+        tau_m = jnp.clip(tau_m, 0.01, 10.0)
 
-        # ---- Inactivation gate (h) — ACCELERATED RECOVERY ----
-        # This is the key modification for high-frequency firing
-        # Standard HH: τh ≈ 5-10 ms at subthreshold voltages
-        # Cortical Nav1.1/1.6: τh ≈ 1-3 ms at subthreshold voltages
+        # ---- Inactivation gate (h) — ACCELERATED RECOVERY ONLY ----
+        #
+        # Single modification vs standard HH: τ_h is 2.5× faster at
+        # subthreshold voltages. No h_inf shift — this keeps the alpha/beta
+        # rates fully self-consistent and avoids gradient path complexity.
+        #
+        # Standard HH at Vrest (-67 mV): τ_h ≈ 6-8 ms → too slow for 50 Hz
+        # Cortical Nav1.1 at Vrest:       τ_h ≈ 2-3 ms → allows 50+ Hz
+        #
+        # Acceleration is voltage-dependent with a smooth, wide transition:
+        #   - At subthreshold (V << -40 mV): 2.5× faster recovery
+        #   - During spikes (V >> -20 mV):   1× (standard speed)
+        #   - Wide sigmoid (k=8) ensures smooth gradient through spike crossing
 
-        # Voltage-dependent rates (modified for fast recovery)
+        # Standard alpha/beta for h (Traub & Miles formulation)
         alpha_h = 0.128 * _safe_exp(-(v + 50.0) / 18.0)
         beta_h = 4.0 / (1.0 + _safe_exp(-(v + 27.0) / 5.0))
 
-        # Steady-state (unchanged from standard HH)
+        # Standard h_inf (UNSHIFTED — consistent with alpha_h, beta_h)
         h_inf = alpha_h / (alpha_h + beta_h)
-
-        # Time constant — KEY MODIFICATION
-        # Standard HH: tau_h = 1.0 / (alpha_h + beta_h)
-        # Cortical: 2.5× faster at rest, less acceleration during spikes
         tau_h_standard = 1.0 / (alpha_h + beta_h)
 
-        # Acceleration factor: 2× at subthreshold (V < -40 mV),
-        # smoothly transitions to 1× (no acceleration) during spikes
-        # FIX: Use (1 - sigmoid) so acceleration is HIGH at rest, LOW during spikes
-        # Reduced from 1.5 to 1.0 multiplier (2× instead of 2.5×) for stability
-        accel_factor = 1.0 + 1.0 * (1.0 - _sigmoid(v, -40.0, -10.0))
-        tau_h = tau_h_standard / accel_factor
+        # Voltage-dependent acceleration: 2.5× at rest, 1× during spikes
+        accel = 1.0 + 1.5 * (1.0 - _sigmoid(v, -40.0, 8.0))
+        tau_h = tau_h_standard / accel
 
-        tau_h = jnp.clip(tau_h, 0.3, 20.0)  # Gradient safety (raised floor to 0.3 ms)
+        tau_h = jnp.clip(tau_h, 0.3, 20.0)  # Gradient safety
 
         # ---- Update gates ----
-        alpha_m_eff, beta_m_eff = _alpha_beta_from_inf_tau(m_inf, tau_m)
+        # Use consistent alpha/beta derived from the SAME h_inf and tau_h
         alpha_h_eff, beta_h_eff = _alpha_beta_from_inf_tau(h_inf, tau_h)
 
+        alpha_m_eff, beta_m_eff = _alpha_beta_from_inf_tau(m_inf, tau_m)
         new_m = solve_gate_exponential(m, dt, alpha_m_eff, beta_m_eff)
         new_h = solve_gate_exponential(h, dt, alpha_h_eff, beta_h_eff)
 
