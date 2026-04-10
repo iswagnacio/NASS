@@ -46,7 +46,6 @@ Requires:
 """
 
 import os
-os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import json
 import logging

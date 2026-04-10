@@ -213,7 +213,9 @@ class DiagnosticReport:
             else:
                 lines.append(
                     f"- **FIRING RATE TOO HIGH**: {self.n_sim_spikes} vs {self.n_target_spikes}. "
-                    f"Consider: adding IM/IAHP, wider K/Kv3 bounds, larger radius.")
+                    f"Consider: wider K/Kv3 bounds, larger radius, higher capacitance. "
+                    f"Do NOT add IM/IAHP for PV+ fast-spiking interneurons — these cells "
+                    f"show minimal spike-frequency adaptation in vivo.")
 
         if self.broad_spikes:
             lines.append("- **BROAD SPIKES**: Consider adding Kv3 for faster repolarisation.")
@@ -309,11 +311,18 @@ CUSTOM: Kv3 (fast K+, FS cells), IM (M-type, adaptation), IAHP (AHP),
 
 Na, K, and Leak are always auto-inserted.
 
+**CHANNEL SELECTION WARNING**: IM (M-type) and IAHP provide spike-frequency
+adaptation. PV+ fast-spiking interneurons show MINIMAL adaptation (ISI CV < 0.15).
+Do NOT add IM or IAHP for PV+ FS cells — they will suppress firing rate without
+improving the fit. Use Kv3 + conductance/geometry tuning instead.
+
 ## Critical Single-Compartment Modeling Rules
 
 1. Na_gNa init MUST be >= 0.10 S/cm². Below this, Kv3 suppresses all spiking
    and every gradient is NaN. This is a Jaxley single-compartment requirement
    (real neurons have concentrated Na at the AIS; one compartment needs more).
+   **Set Na_gNa lower bound to 0.10 S/cm² (not 0.15).** The optimizer needs room
+   to explore the 0.10-0.15 range where spike count is most sensitive.
 
 2. **eNa PARADOX (CRITICAL)**: In single-compartment HH models, LOWER eNa often
    produces MORE spikes. This is counterintuitive but well-documented:
@@ -356,7 +365,8 @@ Do NOT widen eNa beyond what previously produced spikes.
 If the model has 0 spikes with eNa already at 115 mV, the problem is
 NOT that eNa is too low. Check:
   1. Is radius too large? (>12 µm dilutes current density)
-  2. Is Na_gNa too low? (needs ≥0.10, ideally 0.15-0.35 for FS cells)
+  2. Is Na_gNa too low? (needs ≥0.10, ideally 0.15-0.35 for FS cells;
+     set lower bound to 0.10, NOT 0.15 — the optimizer needs room below 0.15)
   3. Is the previous best proposal's eNa much lower? If so, REVERT to it.
   4. Are conductance ratios wrong? (Na should dominate over K+Kv3 combined)
 
@@ -519,11 +529,16 @@ class OuterLoop:
             self.api_key = api_key
         elif provider == "anthropic":
             self.api_key = os.environ.get("ANTHROPIC_API_KEY")
+        elif provider == "deepseek":
+            self.api_key = os.environ.get("DEEPSEEK_API_KEY")
         else:
             self.api_key = os.environ.get("OPENAI_API_KEY")
 
         if not self.api_key:
-            raise ValueError("No API key found. Set ANTHROPIC_API_KEY in .env or pass api_key=.")
+            raise ValueError(
+                f"No API key found for provider '{provider}'. "
+                f"Set the appropriate key in .env: "
+                f"ANTHROPIC_API_KEY, DEEPSEEK_API_KEY, or OPENAI_API_KEY.")
 
     def _extract_trace_features(self) -> str:
         """
@@ -575,6 +590,16 @@ class OuterLoop:
         elif self.provider == "openai":
             import openai
             client = openai.OpenAI(api_key=self.api_key)
+            response = client.chat.completions.create(
+                model=self.model, max_tokens=2000,
+                messages=[{"role": "system", "content": system},
+                          {"role": "user", "content": user}])
+            return response.choices[0].message.content
+        elif self.provider == "deepseek":
+            import openai
+            client = openai.OpenAI(
+                api_key=self.api_key,
+                base_url="https://api.deepseek.com")
             response = client.chat.completions.create(
                 model=self.model, max_tokens=2000,
                 messages=[{"role": "system", "content": system},

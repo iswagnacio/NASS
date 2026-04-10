@@ -21,7 +21,6 @@ Usage:
 """
 
 import os
-os.environ["JAX_PLATFORMS"] = "cpu"
 os.environ['JAX_TRACEBACK_FILTERING_MODE'] = 'off'
 import json
 import logging
@@ -53,13 +52,13 @@ def main():
              "or OPENAI_API_KEY env vars."
     )
     parser.add_argument(
-        "--provider", type=str, default="anthropic",
-        choices=["anthropic", "openai"],
-        help="LLM provider (default: anthropic)"
+        "--provider", type=str, default="deepseek",
+        choices=["anthropic", "openai", "deepseek"],
+        help="LLM provider (default: deepseek)"
     )
     parser.add_argument(
-        "--model", type=str, default="claude-sonnet-4-20250514",
-        help="Model name (default: claude-sonnet-4-20250514)"
+        "--model", type=str, default="deepseek-chat",
+        help="Model name (default: deepseek-chat)"
     )
     parser.add_argument(
         "--data-dir", type=str, default="cell_types_data",
@@ -97,6 +96,8 @@ def main():
     if api_key is None:
         if args.provider == "anthropic":
             api_key = os.environ.get("ANTHROPIC_API_KEY")
+        elif args.provider == "deepseek":
+            api_key = os.environ.get("DEEPSEEK_API_KEY")
         else:
             api_key = os.environ.get("OPENAI_API_KEY")
 
@@ -105,7 +106,7 @@ def main():
         print("  Options:")
         print("    1. Add ANTHROPIC_API_KEY=sk-ant-... to .env file")
         print("    2. Use --api-key sk-ant-...")
-        print("    3. Set ANTHROPIC_API_KEY / OPENAI_API_KEY env var")
+        print("    3. Set ANTHROPIC_API_KEY / OPENAI_API_KEY / DEEPSEEK_API_KEY env var")
         exit(1)
 
     # ---- Resolve specimen ID ----
