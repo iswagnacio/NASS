@@ -219,15 +219,29 @@ def _single_sweep_phase1_loss(v_sim, target_v, shared,
                   + jnp.mean(jnp.abs(sim_stds / std_scale - tgt_stds / std_scale)))
 
     # Soft spike count
+    # For target > 0: use ratio-based error (scale-invariant for comparing
+    # across sweeps with different spike counts).
+    # For target = 0 (subthreshold sweep): use absolute count penalty
+    # (any spike is bad, but don't blow up the loss as soft_count grows).
     spike_k = shared["spike_k"]
     spike_threshold = shared["spike_threshold"]
-    target_spike_count = shared["target_spike_count"]
+    target_spike_count = shared["target_spike_count"]  # floored to >= 1
+    raw_target = shared.get("raw_target_spike_count", 0)
 
     p = jax.nn.sigmoid(spike_k * (v_s - spike_threshold))
     dp = jnp.diff(p)
     soft_events = jax.nn.relu(dp)
     soft_count = jnp.sum(soft_events)
-    spike_loss = (soft_count / target_spike_count - 1.0) ** 2
+
+    if raw_target > 0:
+        # Normal case: ratio-based relative error
+        spike_loss = (soft_count / target_spike_count - 1.0) ** 2
+    else:
+        # Subthreshold case (target=0): absolute count penalty, saturating.
+        # Use tanh to bound the penalty so a wildly over-firing model
+        # doesn't dominate the total loss. Penalty saturates near 1.0
+        # as soft_count grows beyond ~10.
+        spike_loss = jnp.tanh(soft_count / 5.0) ** 2
 
     # Baseline Vrest loss
     n_baseline = shared["n_baseline_est"]

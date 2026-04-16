@@ -78,7 +78,33 @@ class TopKHeap:
             heapq.heapreplace(self._heap, proposal)
 
     def best(self) -> Optional[ModelProposal]:
-        return min(self._heap, key=lambda p: p.loss) if self._heap else None
+        """
+        Select best proposal by spike-aware composite score.
+
+        Training loss is dominated by MSE, which scales with |eNa - Vrest|^2
+        rather than spike count quality. A model with correct spike count but
+        high eNa can have worse loss than a model that over-fires at low eNa.
+
+        Score = loss * (1 + alpha * spike_error_ratio), where spike_error_ratio
+        is |n_sim - n_target| / max(n_target, 1). This penalizes over/under-firing
+        beyond what MSE captures, while still using loss as the primary signal.
+        """
+        if not self._heap:
+            return None
+
+        def score(p):
+            diag = p.diagnostics or {}
+            n_sim = diag.get("n_sim_spikes", 0) if isinstance(diag, dict) else getattr(diag, "n_sim_spikes", 0)
+            n_tgt = diag.get("n_target_spikes", 0) if isinstance(diag, dict) else getattr(diag, "n_target_spikes", 0)
+            # Handle nested diagnostics dict
+            if isinstance(diag, dict) and "n_sim_spikes" not in diag and "diagnostics" in diag:
+                inner = diag.get("diagnostics", {})
+                n_sim = inner.get("n_sim_spikes", n_sim) if isinstance(inner, dict) else n_sim
+                n_tgt = inner.get("n_target_spikes", n_tgt) if isinstance(inner, dict) else n_tgt
+            spike_err = abs(n_sim - n_tgt) / max(n_tgt, 1)
+            return p.loss * (1.0 + 2.0 * spike_err)
+
+        return min(self._heap, key=score)
 
     def worst_loss(self) -> float:
         return max(p.loss for p in self._heap) if self._heap else float("inf")
@@ -349,6 +375,16 @@ improving the fit. Use Kv3 + conductance/geometry tuning instead.
 
 6. All conductances are in S/cm² (NOT mS/cm²). Classic HH Na = 0.12 S/cm².
 
+7. **Leak_eLeak MUST stay near measured Vrest (±2 mV)**. This sets the resting
+   potential of the model. The optimizer will try to drift Leak_eLeak toward
+   extreme values (e.g. -78 mV when Vrest is -67.6 mV) to compensate for f-I
+   curve mismatch — DO NOT let it. Use bounds Vrest±2 mV strictly:
+   - If trace features report Vrest = -67.6 mV → use Leak_eLeak bounds [-69.6, -65.6]
+   - A drifted Leak_eLeak causes the model to over-fire on subthreshold held-out
+     stimuli (noise, ramp), because the resting potential is too close to threshold.
+   - Tight bounds here will FORCE the optimizer to fix the f-I curve via
+     conductance/geometry, which is the correct biophysical solution.
+
 ## What To Do When Spikes Are Too Few (But >0)
 
 When a model produces SOME spikes but not enough, the issue is NOT eNa being
@@ -429,6 +465,12 @@ You MUST include param_config entries for at least: Na_gNa, K_gK, Leak_gLeak,
 Leak_eLeak, eNa, eK. Use the trace features to set appropriate bounds
 (e.g., eNa should be 30-70 mV above spike peak but NOT above 90 mV for
 fast-spiking cells; eK must be below AHP trough).
+
+**Leak_eLeak bounds MUST be Vrest ± 2 mV** (where Vrest is from the trace
+features above). For example, if Vrest = -67.6 mV, use Leak_eLeak bounds
+[-69.6, -65.6]. This prevents the optimizer from drifting the resting
+potential to extremes, which causes over-firing on held-out subthreshold
+stimuli.
 
 Set radius and capacitance as top-level fields (NOT in param_config).
 For fast-spiking cells, use radius=6-10 µm and capacitance=1.0-1.5 µF/cm².

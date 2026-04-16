@@ -269,14 +269,19 @@ def load_multiple_sweeps(ctc: CellTypesCache, specimen_id: int,
     """
     Load multiple training sweeps for multi-sweep fitting.
 
-    Selection strategy (anchor + spread):
-      1. Find the sweep with the most spikes — this is the anchor
-         (best training signal, most informative for the optimizer)
-      2. Add one sweep below the anchor amplitude (near-rheobase)
-      3. Add one sweep above the anchor amplitude (higher firing rate)
+    Selection strategy (anchor + spread + subthreshold):
+      1. Anchor: sweep with the most spikes (best training signal)
+      2. Near-rheobase spiking sweep BELOW anchor
+      3. Spiking sweep ABOVE anchor (higher firing rate)
+      4. **SUBTHRESHOLD sweep** (0 spikes, highest available amplitude)
+         — teaches the model where f-I curve floor is, preventing
+         spurious spikes on held-out subthreshold stimuli.
 
-    This ensures the most informative sweep is always included,
-    while also constraining the f-I curve across amplitudes.
+    For n_sweeps=3: (anchor, below, above) — all spiking, matches previous
+        behavior. No subthreshold constraint.
+    For n_sweeps=4: adds subthreshold sweep for f-I floor supervision.
+    For n_sweeps>=5: additional slots filled by remaining spiking sweeps,
+        then non-spiking sweeps spread across amplitude range.
 
     Falls back to evenly-spaced amplitude selection if no spiking
     sweeps are found (same as original behavior).
@@ -291,8 +296,9 @@ def load_multiple_sweeps(ctc: CellTypesCache, specimen_id: int,
 
     by_amp = sorted(train_sweeps, key=lambda s: s.get("stimulus_amplitude", 0) or 0)
 
-    # Identify spiking sweeps
+    # Identify spiking and subthreshold sweeps
     spiking = [sw for sw in by_amp if (sw.get("num_spikes") or 0) > 0]
+    subthreshold = [sw for sw in by_amp if (sw.get("num_spikes") or 0) == 0]
 
     if spiking:
         # Anchor: sweep with the most spikes
@@ -343,7 +349,29 @@ def load_multiple_sweeps(ctc: CellTypesCache, specimen_id: int,
                 selected.append(choice)
                 selected_numbers.add(choice["sweep_number"])
 
-        # Fill remaining slots if n_sweeps > 3
+        if n_sweeps >= 4:
+            # CRITICAL: Add one SUBTHRESHOLD sweep (0 spikes) to teach the
+            # model where the f-I curve floor is. Without this, the model
+            # over-fires on subthreshold held-out inputs.
+            #
+            # Strategy: pick the highest-amplitude subthreshold sweep
+            # (closest to rheobase from below — most informative about
+            # where threshold should be).
+            available_sub = [sw for sw in subthreshold
+                             if sw["sweep_number"] not in selected_numbers]
+            if available_sub:
+                sub_choice = max(available_sub,
+                                 key=lambda s: s.get("stimulus_amplitude", 0) or 0)
+                selected.append(sub_choice)
+                selected_numbers.add(sub_choice["sweep_number"])
+                logger.info(f"  Added subthreshold sweep #{sub_choice['sweep_number']} "
+                            f"(amp={sub_choice.get('stimulus_amplitude', 0):.0f} pA, "
+                            f"0 spikes) for f-I floor constraint")
+            else:
+                logger.warning(f"  No subthreshold sweep available — "
+                               f"f-I floor will not be constrained")
+
+        # Fill remaining slots if n_sweeps > 4
         # IMPORTANT: never duplicate sweeps — each sweep_number appears at most once
         if len(selected) < n_sweeps:
             # First: add remaining spiking sweeps (most informative)
