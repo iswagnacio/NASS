@@ -555,7 +555,8 @@ class OuterLoop:
     def __init__(self, specimen_id: int, data_dir: str,
                  api_key: str = None, model: str = "claude-sonnet-4-20250514",
                  top_k: int = 5, provider: str = "anthropic",
-                 inner_epochs: int = 300, inner_lr: float = 0.02, n_sweeps: int = 1):
+                 inner_epochs: int = 300, inner_lr: float = 0.02, n_sweeps: int = 1,
+                 n_starts: int = 5, max_duration_ms: float = 1200.0):
         self.specimen_id = specimen_id
         self.data_dir = Path(data_dir)
         self.model = model
@@ -566,6 +567,8 @@ class OuterLoop:
         self.inner_lr = inner_lr
         self.trace_features_text = ""  # Populated once at start of run()
         self.n_sweeps = n_sweeps  # default 1
+        self.n_starts = n_starts  # multi-start probe count; 1 disables probing
+        self.max_duration_ms = max_duration_ms  # stimulus-window cap in ms
 
         if api_key:
             self.api_key = api_key
@@ -697,7 +700,8 @@ class OuterLoop:
         from general_fit import fit_proposal
         return fit_proposal(proposal=proposal, specimen_id=self.specimen_id,
                             data_dir=str(self.data_dir), epochs=self.inner_epochs,
-                            lr=self.inner_lr, n_starts=5,
+                            lr=self.inner_lr, n_starts=self.n_starts,
+                            max_duration_ms=self.max_duration_ms,
                             warm_start_params=warm_start,
                             n_sweeps=self.n_sweeps)
 

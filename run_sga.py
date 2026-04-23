@@ -22,6 +22,24 @@ Usage:
 
 import os
 os.environ['JAX_TRACEBACK_FILTERING_MODE'] = 'off'
+
+# ---------------------------------------------------------------------------
+# JAX persistent compilation cache
+# ---------------------------------------------------------------------------
+# Saves compiled XLA kernels between runs. Cold-start runs still pay the
+# full compile cost; every subsequent run reuses cached kernels as long as
+# the shape/dtype/op graph is unchanged. Typical savings: 30-60 s per cold
+# start when iterating on code.
+#
+# Disable by setting NASS_DISABLE_JIT_CACHE=1 (useful when a JAX version
+# bump invalidates cached entries and you want a clean rebuild).
+if not os.environ.get("NASS_DISABLE_JIT_CACHE"):
+    import jax
+    _cache_dir = os.environ.get("NASS_JIT_CACHE_DIR", "./.jax_cache")
+    jax.config.update("jax_compilation_cache_dir", _cache_dir)
+    jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+    jax.config.update("jax_persistent_cache_min_compile_time_secs", 1.0)
+
 import json
 import logging
 import argparse
@@ -87,6 +105,19 @@ def main():
     parser.add_argument(
         "--n-sweeps", type=int, default=1,
         help="Number of training sweeps to fit simultaneously (1=single, 2-3=multi)"
+    )
+    parser.add_argument(
+        "--n-starts", type=int, default=5,
+        help="Multi-start probe count per proposal (default: 5). "
+             "Set to 1 to skip probing entirely (fastest, use for dev loops); "
+             "2-3 gives some diversity at lower cost; 5 is the full search."
+    )
+    parser.add_argument(
+        "--max-duration-ms", type=float, default=1200.0,
+        help="Maximum stimulus-window length in ms (default: 1200). "
+             "Shorter windows reduce ODE step count linearly — useful for "
+             "smoke tests. Do not reduce below the length of your longest "
+             "real stimulus for production runs."
     )
 
     args = parser.parse_args()
@@ -176,6 +207,9 @@ def main():
     print(f"  Inner epochs:   {args.inner_epochs}")
     print(f"  Inner LR:       {args.inner_lr}")
     print(f"  Top-K:          {args.top_k}")
+    print(f"  N sweeps:       {args.n_sweeps}")
+    print(f"  N starts:       {args.n_starts}")
+    print(f"  Max duration:   {args.max_duration_ms:.1f} ms")
     print("=" * 60 + "\n")
 
     # ---- Run the outer loop ----
@@ -191,6 +225,8 @@ def main():
         inner_epochs=args.inner_epochs,
         inner_lr=args.inner_lr,
         n_sweeps=args.n_sweeps,
+        n_starts=args.n_starts,
+        max_duration_ms=args.max_duration_ms,
     )
 
     best = loop.run(
