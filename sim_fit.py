@@ -597,7 +597,7 @@ def prepare_target(sweep: dict, dt: float = 0.025) -> np.ndarray:
 # 3. Simulation & Loss Functions
 # ---------------------------------------------------------------------------
 
-def setup_simulation(cell: jx.Compartment, stimulus: np.ndarray,
+def setup_simulation(cell, stimulus: np.ndarray,
                      dt: float = 0.025, t_max: float = None):
     """
     Configure stimulus injection and recording on the cell.
@@ -605,6 +605,10 @@ def setup_simulation(cell: jx.Compartment, stimulus: np.ndarray,
 
     Uses cell.stimulate() which registers the stimulus persistently,
     so jx.integrate() knows the simulation duration.
+
+    Handles both single-compartment (jx.Compartment) and two-compartment
+    (jx.Cell) models. For Cell, stimulus and recording target the soma
+    (branch 0, loc 0.0) — matching the experimental patch-clamp setup.
     """
     cell.delete_stimuli()
     cell.delete_recordings()
@@ -612,10 +616,15 @@ def setup_simulation(cell: jx.Compartment, stimulus: np.ndarray,
     # Inject the full stimulus waveform using .stimulate()
     # stimulus must be shape (n_timesteps,) — Jaxley infers duration from it
     i_ext = jnp.array(stimulus)
-    cell.stimulate(i_ext)
 
-    # Record membrane voltage
-    cell.record("v")
+    if isinstance(cell, jx.Cell):
+        # Two-compartment: stimulate and record at soma (branch 0)
+        cell.branch(0).loc(0.0).stimulate(i_ext)
+        cell.branch(0).loc(0.0).record("v")
+    else:
+        # Single-compartment (legacy)
+        cell.stimulate(i_ext)
+        cell.record("v")
 
     return cell
 

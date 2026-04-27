@@ -81,10 +81,13 @@ CUSTOM_CHANNELS = {name: info["class"] for name, info in CHANNEL_REGISTRY.items(
 ALL_CHANNELS = {**BUILTIN_CHANNELS, **CUSTOM_CHANNELS}
 
 FALLBACK_PARAM_BOUNDS = {
-    "Na_gNa":    {"init": 0.10, "lower": 0.01,  "upper": 0.20},
+    # Soma Na density — tightly bounded for two-compartment model.
+    # Phase A showed soma_gNa=0.001 produces realistic +24 mV somatic peaks.
+    # Above ~0.005, soma regenerates full-amplitude spikes (defeats 2-comp purpose).
+    "Na_gNa":    {"init": 0.001, "lower": 0.0,   "upper": 0.005},
     "K_gK":      {"init": 0.005, "lower": 0.001, "upper": 0.05},
     "Leak_gLeak":{"init": 0.0001,"lower": 1e-5,  "upper": 0.002},
-    "Leak_eLeak":{"init": -70.0, "lower": -85.0, "upper": -50.0},
+    "Leak_eLeak":{"init": -70.0, "lower": -90.0, "upper": -50.0},
     "Kv3_gKv3":  {"init": 0.005, "lower": 5e-4,  "upper": 0.03},
     "IM_gM":     {"init": 7e-5,  "lower": 1e-6,  "upper": 0.005},
     "IAHP_gAHP": {"init": 1e-4,  "lower": 1e-6,  "upper": 0.005},
@@ -95,6 +98,10 @@ FALLBACK_PARAM_BOUNDS = {
     "eK":        {"init": -90.0, "lower": -110.0, "upper": -70.0},
     "capacitance":{"init": 1.0,  "lower": 0.5,   "upper": 2.0},
     "radius":    {"init": 10.0,  "lower": 3.0,   "upper": 12.0},
+    # Axial resistivity — controls AIS-soma coupling / spike attenuation.
+    # Phase A: Ra=150 with soma_gNa=0.001 gives +24 mV soma peak (target: +25).
+    # Ra<50: minimal attenuation. Ra>500: AIS decouples.
+    "axial_resistivity": {"init": 150.0, "lower": 50.0, "upper": 500.0},
 }
 
 DEFAULT_PARAM_BOUNDS = FALLBACK_PARAM_BOUNDS
@@ -112,7 +119,14 @@ CHANNEL_CONDUCTANCE_PARAMS = {
     "IH":   ["IH_gH"],
 }
 
-GLOBAL_TRAINABLE = ["eNa", "eK", "capacitance", "radius"]
+GLOBAL_TRAINABLE = []  # EMPTY — global data_set breaks AIS
+# eNa, eK, capacitance, radius are ALL fixed at construction values.
+# make_trainable() removes params from the cell's fixed state table,
+# and param_state only provides values for the trainable branch.
+# The AIS (branch 1) then loses these params → spiking dies.
+# The 5 conductance params (Na_gNa, K_gK, Leak_gLeak, Leak_eLeak,
+# Kv3_gKv3) work because they're prefixed differently on AIS (NaAIS_gNa etc).
+SOMA_TRAINABLE = []  # EMPTY — conductances are sufficient for Phase B
 
 
 # ===========================================================================
@@ -132,12 +146,14 @@ def _clamp_param_bounds(name: str, cfg: dict,
 
     cfg = dict(cfg)
     _STATIC_CEILINGS = {
-        "Na_gNa": 0.50, "K_gK": 0.10, "Leak_gLeak": 0.005,
+        "Na_gNa": 0.01, "K_gK": 0.10, "Leak_gLeak": 0.005,
         "Kv3_gKv3": 0.10, "IM_gM": 0.01, "IAHP_gAHP": 0.01,
         "IT_gT": 0.01, "ICaL_gCaL": 0.01, "IH_gH": 0.005,
     }
-    _STATIC_FLOORS = {"eNa": 30.0, "eK": -120.0, "capacitance": 0.2, "radius": 1.5}
-    _STATIC_GLOBALS = {"eNa": 115.0, "eK": -55.0, "capacitance": 3.0, "radius": 20.0}
+    _STATIC_FLOORS = {"eNa": 30.0, "eK": -120.0, "capacitance": 0.2, "radius": 1.5,
+                       "axial_resistivity": 30.0}
+    _STATIC_GLOBALS = {"eNa": 115.0, "eK": -55.0, "capacitance": 3.0, "radius": 20.0,
+                        "axial_resistivity": 2000.0}
 
     if name in _STATIC_CEILINGS and cfg.get("upper", 0) > _STATIC_CEILINGS[name]:
         cfg["upper"] = _STATIC_CEILINGS[name]
@@ -157,6 +173,25 @@ def _ensure_init_margin(init_val, lower, upper, margin_frac=0.05):
     """Ensure init is not at sigmoid boundary (prevents logit → ±inf)."""
     margin = (upper - lower) * margin_frac
     return float(max(lower + margin, min(upper - margin, init_val)))
+
+
+def _apply_params_to_cell(cell, params, param_names, param_branches):
+    """
+    Apply trainable params with branch-aware scoping for 2-comp cells.
+
+    For branch-specific params (branch != None), uses cell.branch(b).data_set()
+    so we only modify soma conductances without overwriting AIS values.
+    For global params (branch == None), uses cell.data_set().
+    """
+    param_state = None
+    for i, name in enumerate(param_names):
+        branch = param_branches[i] if param_branches else None
+        if branch is not None and isinstance(cell, jx.Cell):
+            param_state = cell.branch(branch).data_set(
+                name, params[i][name], param_state)
+        else:
+            param_state = cell.data_set(name, params[i][name], param_state)
+    return param_state
 
 
 # ===========================================================================
@@ -190,13 +225,55 @@ def _geometry_bounds_from_proposal(proposal: ModelProposal) -> dict:
 
 
 # ===========================================================================
-# Build Cell from Proposal
+# AIS (Axon Initial Segment) Configuration — FIXED, not LLM-proposed
+# ===========================================================================
+
+AIS_CONFIG = {
+    # AIS channels use DIFFERENT name prefixes to avoid data_set collision.
+    # Jaxley 0.13.0's data_set("Na_gNa", value) overwrites ALL compartments
+    # with that parameter name, even when called on a branch View.
+    # Solution: AIS channels get unique names → unique param prefixes.
+    #   NaCortical(name="NaAIS")  → param "NaAIS_gNa" (not "Na_gNa")
+    #   Kv3(name="Kv3AIS")       → param "Kv3AIS_gKv3" (not "Kv3_gKv3")
+    #   K(name="KAIS")           → param "KAIS_gK" (not "K_gK")
+    #   Leak(name="LeakAIS")     → param "LeakAIS_gLeak" (not "Leak_gLeak")
+    # Note: "eNa" and "eK" are global (unprefixed) — shared by all channels.
+    "channel_inits": [
+        # (class, name_override, {param: value})
+        (NaCortical, "NaAIS",  {"NaAIS_gNa": 0.25}),
+        (Kv3,       "Kv3AIS", {"Kv3AIS_gKv3": 0.015}),
+        (K,         "KAIS",   {"KAIS_gK": 0.01}),
+        (Leak,      "LeakAIS",{"LeakAIS_gLeak": 0.0001, "LeakAIS_eLeak": -67.0}),
+    ],
+    "radius": 0.75,         # µm — AIS ~1-1.5 µm diameter
+    "length": 30.0,         # µm — AIS ~20-40 µm long
+}
+
+
+# ===========================================================================
+# Build Cell from Proposal — Two-Compartment (Soma + AIS)
 # ===========================================================================
 
 def build_cell_from_proposal(proposal: ModelProposal,
                               adaptive_limits: tuple = None) -> tuple:
     """
-    Build a Jaxley single-compartment cell from a ModelProposal.
+    Build a two-compartment Jaxley cell from a ModelProposal.
+
+    Architecture:
+        Branch 0 (soma): LLM-proposed channels, trainable conductances
+        Branch 1 (AIS):  Fixed NaCortical + Kv3 + K + Leak, NOT trainable
+
+    The AIS generates full-amplitude spikes. The soma sees an attenuated
+    version through axial resistance, producing realistic ~25 mV somatic
+    peaks (vs +55 mV in single-compartment models).
+
+    Phase A validation (two_comp_test_v2.py):
+        soma_gNa=0.001, Ra=150 -> soma peak=24.3 mV (target: 25 mV)
+
+    Returns:
+        cell: jx.Cell (two-compartment)
+        trainable: list of {"name", "lower", "upper", "branch"} dicts
+        error: str or None
     """
     invalid = [ch for ch in proposal.channels if ch not in ALL_CHANNELS]
     if invalid:
@@ -209,17 +286,50 @@ def build_cell_from_proposal(proposal: ModelProposal,
             logger.info(f"  Auto-added required channel: {required}")
 
     try:
-        comp = jx.Compartment()
+        # ---- Build two-compartment cell ----
+        soma_comp = jx.Compartment()
+        ais_comp = jx.Compartment()
+
+        try:
+            soma_branch = jx.Branch(soma_comp, ncomp=1)
+            ais_branch = jx.Branch(ais_comp, ncomp=1)
+        except TypeError:
+            soma_branch = jx.Branch(soma_comp, nseg=1)
+            ais_branch = jx.Branch(ais_comp, nseg=1)
+
+        cell = jx.Cell([soma_branch, ais_branch], parents=[-1, 0])
+
+        # ---- Soma: LLM-proposed channels (branch 0) ----
         for ch_name in channels:
-            comp.insert(ALL_CHANNELS[ch_name]())
+            cell.branch(0).insert(ALL_CHANNELS[ch_name]())
 
-        comp.set("radius", proposal.radius)
-        comp.set("length", proposal.length)
-        comp.set("capacitance", proposal.capacitance)
-        comp.set("axial_resistivity", 100.0)
-        comp.set("eNa", 50.0)
-        comp.set("eK", -90.0)
+        cell.branch(0).set("radius", proposal.radius)
+        cell.branch(0).set("length", proposal.length)
 
+        # ---- AIS: Fixed channels with UNIQUE name prefixes (branch 1) ----
+        # Jaxley 0.13.0's data_set overwrites ALL compartments sharing a
+        # param name. Using different names (NaAIS_gNa vs Na_gNa) prevents
+        # soma data_set from touching AIS conductances.
+        for ch_cls, ch_name, ch_params in AIS_CONFIG["channel_inits"]:
+            cell.branch(1).insert(ch_cls(name=ch_name))
+            for param_name, param_val in ch_params.items():
+                cell.branch(1).set(param_name, param_val)
+
+        cell.branch(1).set("radius", AIS_CONFIG["radius"])
+        cell.branch(1).set("length", AIS_CONFIG["length"])
+
+        # ---- Global parameters ----
+        cell.set("capacitance", proposal.capacitance)
+        cell.set("axial_resistivity", 150.0)  # fixed (Phase A validated)
+        # ---- Reversal potentials ----
+        # Set globally first, then soma values will be overridden by optimizer
+        # via cell.branch(0).data_set(). AIS keeps these construction values.
+        cell.set("eNa", 55.0)     # physiological Na reversal (AIS keeps this)
+        cell.set("eK", -90.0)     # physiological K reversal (AIS keeps this)
+        cell.set("Leak_eLeak", -70.0)
+        cell.set("v", -67.0)
+
+        # ---- Set soma channel conductances ----
         for ch_name in channels:
             for param_name in CHANNEL_CONDUCTANCE_PARAMS.get(ch_name, []):
                 if param_name in proposal.param_config:
@@ -233,16 +343,22 @@ def build_cell_from_proposal(proposal: ModelProposal,
                 else:
                     continue
                 try:
-                    comp.set(param_name, init_val)
+                    cell.branch(0).set(param_name, init_val)
                 except Exception as e:
-                    logger.warning(f"  Could not set {param_name}={init_val}: {e}")
+                    logger.warning(f"  Could not set soma {param_name}={init_val}: {e}")
+
+        ais_ch_names = [ch_name for _, ch_name, _ in AIS_CONFIG["channel_inits"]]
+        logger.info(f"  Built 2-comp cell: soma channels={channels}, "
+                    f"AIS={ais_ch_names}")
 
     except Exception as e:
         return None, None, f"Cell construction failed: {e}\n{traceback.format_exc()}"
 
+    # ---- Build trainable parameter list ----
     trainable = []
     geometry_overrides = _geometry_bounds_from_proposal(proposal)
 
+    # Soma channel conductances (branch=0)
     for ch_name in channels:
         for param_name in CHANNEL_CONDUCTANCE_PARAMS.get(ch_name, []):
             if param_name in proposal.param_config:
@@ -252,8 +368,10 @@ def build_cell_from_proposal(proposal: ModelProposal,
                 cfg = FALLBACK_PARAM_BOUNDS[param_name]
             else:
                 continue
-            trainable.append({"name": param_name, "lower": cfg["lower"], "upper": cfg["upper"]})
+            trainable.append({"name": param_name, "lower": cfg["lower"],
+                              "upper": cfg["upper"], "branch": 0})
 
+    # Global trainable params (branch=None → whole cell)
     for param_name in GLOBAL_TRAINABLE:
         if param_name in proposal.param_config:
             cfg = _clamp_param_bounds(param_name, proposal.param_config[param_name],
@@ -265,9 +383,25 @@ def build_cell_from_proposal(proposal: ModelProposal,
             cfg = FALLBACK_PARAM_BOUNDS[param_name]
         else:
             continue
-        trainable.append({"name": param_name, "lower": cfg["lower"], "upper": cfg["upper"]})
+        trainable.append({"name": param_name, "lower": cfg["lower"],
+                          "upper": cfg["upper"], "branch": None})
 
-    return comp, trainable, None
+    # Soma-only geometry params (branch=0 → only soma, AIS geometry is fixed)
+    for param_name in SOMA_TRAINABLE:
+        if param_name in proposal.param_config:
+            cfg = _clamp_param_bounds(param_name, proposal.param_config[param_name],
+                                      adaptive_limits)
+        elif param_name in geometry_overrides:
+            cfg = _clamp_param_bounds(param_name, geometry_overrides[param_name],
+                                      adaptive_limits)
+        elif param_name in FALLBACK_PARAM_BOUNDS:
+            cfg = FALLBACK_PARAM_BOUNDS[param_name]
+        else:
+            continue
+        trainable.append({"name": param_name, "lower": cfg["lower"],
+                          "upper": cfg["upper"], "branch": 0})
+
+    return cell, trainable, None
 
 
 # ===========================================================================
@@ -348,7 +482,8 @@ def _build_shared_loss_components(target_v, dt, n_windows=10,
 
 
 def _build_phase1_loss_fn(cell, target_v, dt, transform, param_names,
-                           shared, mse_weight=0.1, stats_weight=5.0,
+                           shared, param_branches=None,
+                           mse_weight=0.1, stats_weight=5.0,
                            spike_count_weight=300.0,
                            baseline_weight=50.0):
     """Phase 1 loss: spike_count + windowed_stats + MSE + baseline_vrest. NO timing."""
@@ -367,9 +502,8 @@ def _build_phase1_loss_fn(cell, target_v, dt, transform, param_names,
 
     def loss_fn(opt_params):
         params = transform.forward(opt_params)
-        param_state = None
-        for i, name in enumerate(param_names):
-            param_state = cell.data_set(name, params[i][name], param_state)
+        param_state = _apply_params_to_cell(
+            cell, params, param_names, param_branches)
 
         try:
             v = jx.integrate(cell, param_state=param_state, delta_t=dt)
@@ -421,7 +555,8 @@ def _build_phase1_loss_fn(cell, target_v, dt, transform, param_names,
 
 
 def _build_phase2_loss_fn(cell, target_v, dt, transform, param_names,
-                           shared, mse_weight=0.1, stats_weight=5.0,
+                           shared, param_branches=None,
+                           mse_weight=0.1, stats_weight=5.0,
                            spike_count_weight=300.0,
                            spike_timing_weight=100.0,
                            baseline_weight=50.0):
@@ -444,9 +579,8 @@ def _build_phase2_loss_fn(cell, target_v, dt, transform, param_names,
 
     def loss_fn(opt_params):
         params = transform.forward(opt_params)
-        param_state = None
-        for i, name in enumerate(param_names):
-            param_state = cell.data_set(name, params[i][name], param_state)
+        param_state = _apply_params_to_cell(
+            cell, params, param_names, param_branches)
 
         try:
             v = jx.integrate(cell, param_state=param_state, delta_t=dt)
@@ -959,6 +1093,7 @@ def fit_proposal(
 
     n_params = len(trainable)
     param_names = [t["name"] for t in trainable]
+    param_branches = [t.get("branch", None) for t in trainable]
     logger.info(f"  Trainable parameters ({n_params}): {param_names}")
 
     # Step 5: Set up simulation
@@ -979,7 +1114,14 @@ def fit_proposal(
             cell = setup_simulation(cell, stimulus, dt, t_max)
 
         for t_info in trainable:
-            cell.make_trainable(t_info["name"])
+            branch = t_info.get("branch", None)
+            if branch is not None:
+                # Soma-specific param: make trainable on branch 0 only
+                cell.branch(branch).make_trainable(t_info["name"])
+            else:
+                # Global param (currently unused — GLOBAL_TRAINABLE is empty)
+                # Kept as fallback if any param has branch=None
+                cell.make_trainable(t_info["name"])
         opt_params = cell.get_parameters()
 
         transforms = []
@@ -993,6 +1135,13 @@ def fit_proposal(
                 )
             })
         transform = ParamTransform(transforms)
+
+        # CRITICAL: get_parameters() returns ACTUAL parameter values
+        # (e.g., Leak_eLeak=-70.0). SigmoidTransform.forward() expects
+        # UNCONSTRAINED values (where 0 → midpoint of bounds). Without
+        # inverse(), sigmoid(-70) ≈ 0 → maps Leak_eLeak to lower bound
+        # (-90), killing spiking. This converts actual → unconstrained.
+        opt_params = transform.inverse(opt_params)
     except Exception as e:
         logger.error(f"  Simulation setup failed: {e}\n{traceback.format_exc()}")
         return DiagnosticReport(proposal=proposal, specimen_id=specimen_id,
@@ -1038,6 +1187,8 @@ def fit_proposal(
             cell, sweep_data_list, dt, transform, param_names,
             spike_timing_weight=100.0,
             pre_data_stimuli=pre_data_stimuli)
+        # TODO: multi-sweep loss functions need param_branches support
+        # for branch-aware data_set in two-compartment models.
 
         # Diagnostic: run one forward pass to verify loss is computable
         try:
@@ -1048,9 +1199,8 @@ def fit_proposal(
             if not np.isfinite(diag_loss_f):
                 # Run per-sweep sims to identify which sweep fails
                 real_p = transform.forward(opt_params)
-                ps = None
-                for i, name in enumerate(param_names):
-                    ps = cell.data_set(name, real_p[i][name], ps)
+                ps = _apply_params_to_cell(
+                    cell, real_p, param_names, param_branches)
                 for si, sd in enumerate(sweep_data_list):
                     try:
                         # Use pre-built data_stimuli — do NOT call
@@ -1075,10 +1225,204 @@ def fit_proposal(
                     f"spike_count=300, stats=5, MSE=0.1, timing=100 (Phase 2)")
  
         loss_fn_p1 = _build_phase1_loss_fn(cell, target_v_jnp, dt, transform,
-                                            param_names, shared)
+                                            param_names, shared,
+                                            param_branches=param_branches)
         loss_fn_p2 = _build_phase2_loss_fn(cell, target_v_jnp, dt, transform,
                                             param_names, shared,
+                                            param_branches=param_branches,
                                             spike_timing_weight=100.0)
+
+    # ===================================================================
+    # DIAGNOSTIC: Test if data_set overwrites AIS parameters
+    # ===================================================================
+    try:
+        # Test 1: Forward pass WITHOUT param_state (cell's built-in values)
+        _diag_v_raw = jx.integrate(cell, delta_t=dt)
+        _raw_np = np.array(_diag_v_raw[0])
+        _raw_spikes = int(np.sum(np.diff((_raw_np > -20).astype(int)) > 0))
+        logger.info(f"  DIAG raw (no param_state): v=[{np.min(_raw_np):.1f}, "
+                    f"{np.max(_raw_np):.1f}], spikes={_raw_spikes}")
+
+        # Test 2: Forward pass WITH param_state (through data_set)
+        _diag_params = transform.forward(opt_params)
+        _diag_ps = _apply_params_to_cell(
+            cell, _diag_params, param_names, param_branches)
+        _diag_v = jx.integrate(cell, param_state=_diag_ps, delta_t=dt)
+        _diag_v_np = np.array(_diag_v[0])
+        _v_nan = int(np.sum(np.isnan(_diag_v_np)))
+        _v_inf = int(np.sum(np.isinf(_diag_v_np)))
+        _v_min, _v_max = float(np.min(_diag_v_np)), float(np.max(_diag_v_np))
+        _n_spikes = int(np.sum(np.diff((_diag_v_np > -20).astype(int)) > 0))
+        logger.info(f"  DIAG with param_state: v=[{_v_min:.1f}, {_v_max:.1f}], "
+                    f"NaN={_v_nan}, Inf={_v_inf}, spikes={_n_spikes}")
+
+        if _raw_spikes > 0 and _n_spikes == 0:
+            logger.warning(f"  DIAG: data_set KILLS SPIKING! "
+                           f"{_raw_spikes} spikes without param_state, "
+                           f"0 with. data_set is overwriting AIS params.")
+
+        # Test 3: Inspect param_state contents for Na_gNa
+        logger.info(f"  DIAG param_state type: {type(_diag_ps)}")
+        if _diag_ps is not None:
+            if isinstance(_diag_ps, list):
+                for pi, ps_item in enumerate(_diag_ps):
+                    if isinstance(ps_item, dict):
+                        for k, v in ps_item.items():
+                            logger.info(f"    ps[{pi}] {k}: shape={v.shape}, "
+                                        f"values={v.flatten()[:4]}")
+                    else:
+                        logger.info(f"    ps[{pi}]: type={type(ps_item)}")
+            elif isinstance(_diag_ps, dict):
+                for k, v in _diag_ps.items():
+                    if hasattr(v, 'shape'):
+                        logger.info(f"    ps[{k}]: shape={v.shape}, "
+                                    f"values={v.flatten()[:4]}")
+                    else:
+                        logger.info(f"    ps[{k}]: {v}")
+
+        # Test 4: Apply params one at a time to find which kills spiking
+        if _raw_spikes > 0 and _n_spikes == 0:
+            logger.info("  DIAG: Testing each param individually...")
+            for i, name in enumerate(param_names):
+                branch = param_branches[i] if param_branches else None
+                _test_ps = None
+                if branch is not None:
+                    _test_ps = cell.branch(branch).data_set(
+                        name, _diag_params[i][name], _test_ps)
+                else:
+                    _test_ps = cell.data_set(
+                        name, _diag_params[i][name], _test_ps)
+                _tv = jx.integrate(cell, param_state=_test_ps, delta_t=dt)
+                _tv_np = np.array(_tv[0])
+                _ts = int(np.sum(np.diff((_tv_np > -20).astype(int)) > 0))
+                logger.info(f"    Only {name} (branch={branch}): "
+                            f"spikes={_ts}, v_max={np.max(_tv_np):.1f}")
+
+
+        # Loss value check
+        _diag_loss_val = loss_fn_p1(opt_params)
+        _diag_loss_f = float(_diag_loss_val)
+        logger.info(f"  DIAG loss: {_diag_loss_f:.4f}, "
+                    f"finite={np.isfinite(_diag_loss_f)}")
+
+        # Gradient check
+        _diag_loss2, _diag_grad = jax.value_and_grad(loss_fn_p1)(opt_params)
+        _all_finite = True
+        for i, d in enumerate(_diag_grad):
+            for k, g in d.items():
+                g_ok = bool(jnp.all(jnp.isfinite(g)))
+                g_max = float(jnp.max(jnp.abs(g))) if g_ok else float('nan')
+                if not g_ok:
+                    _all_finite = False
+                logger.info(f"    grad[{i}] {k:>20s}: "
+                            f"finite={g_ok}, |g|_max={g_max:.6f}")
+        logger.info(f"  DIAG gradient: all_finite={_all_finite}")
+
+        if not _all_finite:
+            # Extra diagnostic: test each loss component separately
+            logger.info("  DIAG: Testing individual loss components...")
+
+            # Test MSE only
+            def _mse_only(opt_p):
+                p = transform.forward(opt_p)
+                ps = _apply_params_to_cell(cell, p, param_names, param_branches)
+                v = jx.integrate(cell, param_state=ps, delta_t=dt)
+                v_s = v[0]
+                n = min(len(v_s), len(target_v_jnp))
+                return jnp.mean((v_s[:n] - target_v_jnp[:n]) ** 2)
+
+            try:
+                _mse_l, _mse_g = jax.value_and_grad(_mse_only)(opt_params)
+                _mse_gf = all(bool(jnp.all(jnp.isfinite(g)))
+                              for d in _mse_g for g in d.values())
+                logger.info(f"    MSE-only: loss={float(_mse_l):.4f}, "
+                            f"grad_finite={_mse_gf}")
+            except Exception as e:
+                logger.info(f"    MSE-only: EXCEPTION {e}")
+
+            # Test spike count only
+            spike_k = shared["spike_k"]
+            spike_threshold = shared["spike_threshold"]
+            raw_tsc = shared["raw_target_spike_count"]
+            spike_norm = shared["spike_loss_normalizer"]
+
+            def _spike_only(opt_p):
+                p = transform.forward(opt_p)
+                ps = _apply_params_to_cell(cell, p, param_names, param_branches)
+                v = jx.integrate(cell, param_state=ps, delta_t=dt)
+                v_s = v[0]
+                n = min(len(v_s), len(target_v_jnp))
+                pr = jax.nn.sigmoid(spike_k * (v_s[:n] - spike_threshold))
+                dp = jnp.diff(pr)
+                soft_count = jnp.sum(jax.nn.relu(dp))
+                return ((soft_count - raw_tsc) / spike_norm) ** 2
+
+            try:
+                _sp_l, _sp_g = jax.value_and_grad(_spike_only)(opt_params)
+                _sp_gf = all(bool(jnp.all(jnp.isfinite(g)))
+                             for d in _sp_g for g in d.values())
+                logger.info(f"    Spike-only: loss={float(_sp_l):.4f}, "
+                            f"grad_finite={_sp_gf}")
+            except Exception as e:
+                logger.info(f"    Spike-only: EXCEPTION {e}")
+
+            # Test stats (windowed mean/std) only
+            n_windows = shared["n_windows"]
+            win_size = shared["win_size"]
+            tgt_means = shared["tgt_means"]
+            tgt_stds = shared["tgt_stds"]
+            mean_scale = shared["mean_scale"]
+            std_scale_val = shared["std_scale"]
+
+            def _stats_only(opt_p):
+                p = transform.forward(opt_p)
+                ps = _apply_params_to_cell(cell, p, param_names, param_branches)
+                v = jx.integrate(cell, param_state=ps, delta_t=dt)
+                v_s = v[0]
+                n = min(len(v_s), len(target_v_jnp))
+                sim_m, sim_s = [], []
+                for w in range(n_windows):
+                    s = w * win_size
+                    e = s + win_size if w < n_windows - 1 else n
+                    win = v_s[s:e]
+                    sim_m.append(jnp.mean(win))
+                    sim_s.append(jnp.std(win))
+                sim_m = jnp.stack(sim_m)
+                sim_s = jnp.stack(sim_s)
+                return (jnp.mean(jnp.abs(sim_m / mean_scale - tgt_means / mean_scale))
+                        + jnp.mean(jnp.abs(sim_s / std_scale_val - tgt_stds / std_scale_val)))
+
+            try:
+                _st_l, _st_g = jax.value_and_grad(_stats_only)(opt_params)
+                _st_gf = all(bool(jnp.all(jnp.isfinite(g)))
+                             for d in _st_g for g in d.values())
+                logger.info(f"    Stats-only: loss={float(_st_l):.4f}, "
+                            f"grad_finite={_st_gf}")
+            except Exception as e:
+                logger.info(f"    Stats-only: EXCEPTION {e}")
+
+            # Test baseline only
+            n_baseline = shared["n_baseline_est"]
+
+            def _baseline_only(opt_p):
+                p = transform.forward(opt_p)
+                ps = _apply_params_to_cell(cell, p, param_names, param_branches)
+                v = jx.integrate(cell, param_state=ps, delta_t=dt)
+                v_s = v[0]
+                n = min(len(v_s), len(target_v_jnp))
+                return jnp.mean((v_s[:n_baseline] - target_v_jnp[:n_baseline]) ** 2)
+
+            try:
+                _bl_l, _bl_g = jax.value_and_grad(_baseline_only)(opt_params)
+                _bl_gf = all(bool(jnp.all(jnp.isfinite(g)))
+                             for d in _bl_g for g in d.values())
+                logger.info(f"    Baseline-only: loss={float(_bl_l):.4f}, "
+                            f"grad_finite={_bl_gf}")
+            except Exception as e:
+                logger.info(f"    Baseline-only: EXCEPTION {e}")
+
+    except Exception as e:
+        logger.error(f"  DIAG EXCEPTION: {e}\n{traceback.format_exc()}")
 
     # Step 7: Set up optimizer
     n_extra_channels = max(0, len(proposal.channels) - 3)
@@ -1334,9 +1678,8 @@ def fit_proposal(
         v_sim = None  # diagnostics will handle this
     else:
         try:
-            param_state = None
-            for i, name in enumerate(param_names):
-                param_state = cell.data_set(name, fitted[i][name], param_state)
+            param_state = _apply_params_to_cell(
+                cell, fitted, param_names, param_branches)
             v_final = jx.integrate(cell, param_state=param_state, delta_t=dt)
             v_sim = np.array(v_final[0])
         except Exception as e:
