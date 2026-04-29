@@ -120,13 +120,11 @@ CHANNEL_CONDUCTANCE_PARAMS = {
 }
 
 GLOBAL_TRAINABLE = []  # EMPTY — global data_set breaks AIS
-# eNa, eK, capacitance, radius are ALL fixed at construction values.
-# make_trainable() removes params from the cell's fixed state table,
-# and param_state only provides values for the trainable branch.
-# The AIS (branch 1) then loses these params → spiking dies.
-# The 5 conductance params (Na_gNa, K_gK, Leak_gLeak, Leak_eLeak,
-# Kv3_gKv3) work because they're prefixed differently on AIS (NaAIS_gNa etc).
-SOMA_TRAINABLE = []  # EMPTY — conductances are sufficient for Phase B
+# eNa/eK are physically global (Nernst potentials) but trained on branch 0
+# only. make_trainable("eNa") on branch(0) keeps AIS eNa at construction
+# value. transform.inverse() ensures init values map correctly.
+# capacitance/radius: soma geometry only (AIS geometry is fixed).
+SOMA_TRAINABLE = ["eNa", "eK", "capacitance", "radius"]
 
 
 # ===========================================================================
@@ -240,6 +238,9 @@ AIS_CONFIG = {
     # Note: "eNa" and "eK" are global (unprefixed) — shared by all channels.
     "channel_inits": [
         # (class, name_override, {param: value})
+        # AIS gNa=0.25: gives ~9 spikes at init vs 18 target — optimizer
+        # can adjust upward. gNa=0.80 gives ~270 spikes, unreachable.
+        # Gradient-stable at all values per ais_gna_grad_sweep.py.
         (NaCortical, "NaAIS",  {"NaAIS_gNa": 0.25}),
         (Kv3,       "Kv3AIS", {"Kv3AIS_gKv3": 0.015}),
         (K,         "KAIS",   {"KAIS_gK": 0.01}),
@@ -1233,7 +1234,7 @@ def fit_proposal(
                                             spike_timing_weight=100.0)
 
     # ===================================================================
-    # DIAGNOSTIC: Test if data_set overwrites AIS parameters
+    # DIAGNOSTIC: Verify data_set doesn't break AIS spiking
     # ===================================================================
     try:
         # Test 1: Forward pass WITHOUT param_state (cell's built-in values)
@@ -1249,180 +1250,17 @@ def fit_proposal(
             cell, _diag_params, param_names, param_branches)
         _diag_v = jx.integrate(cell, param_state=_diag_ps, delta_t=dt)
         _diag_v_np = np.array(_diag_v[0])
-        _v_nan = int(np.sum(np.isnan(_diag_v_np)))
-        _v_inf = int(np.sum(np.isinf(_diag_v_np)))
-        _v_min, _v_max = float(np.min(_diag_v_np)), float(np.max(_diag_v_np))
         _n_spikes = int(np.sum(np.diff((_diag_v_np > -20).astype(int)) > 0))
+        _v_min, _v_max = float(np.min(_diag_v_np)), float(np.max(_diag_v_np))
         logger.info(f"  DIAG with param_state: v=[{_v_min:.1f}, {_v_max:.1f}], "
-                    f"NaN={_v_nan}, Inf={_v_inf}, spikes={_n_spikes}")
+                    f"spikes={_n_spikes}")
 
         if _raw_spikes > 0 and _n_spikes == 0:
-            logger.warning(f"  DIAG: data_set KILLS SPIKING! "
-                           f"{_raw_spikes} spikes without param_state, "
-                           f"0 with. data_set is overwriting AIS params.")
-
-        # Test 3: Inspect param_state contents for Na_gNa
-        logger.info(f"  DIAG param_state type: {type(_diag_ps)}")
-        if _diag_ps is not None:
-            if isinstance(_diag_ps, list):
-                for pi, ps_item in enumerate(_diag_ps):
-                    if isinstance(ps_item, dict):
-                        for k, v in ps_item.items():
-                            logger.info(f"    ps[{pi}] {k}: shape={v.shape}, "
-                                        f"values={v.flatten()[:4]}")
-                    else:
-                        logger.info(f"    ps[{pi}]: type={type(ps_item)}")
-            elif isinstance(_diag_ps, dict):
-                for k, v in _diag_ps.items():
-                    if hasattr(v, 'shape'):
-                        logger.info(f"    ps[{k}]: shape={v.shape}, "
-                                    f"values={v.flatten()[:4]}")
-                    else:
-                        logger.info(f"    ps[{k}]: {v}")
-
-        # Test 4: Apply params one at a time to find which kills spiking
-        if _raw_spikes > 0 and _n_spikes == 0:
-            logger.info("  DIAG: Testing each param individually...")
-            for i, name in enumerate(param_names):
-                branch = param_branches[i] if param_branches else None
-                _test_ps = None
-                if branch is not None:
-                    _test_ps = cell.branch(branch).data_set(
-                        name, _diag_params[i][name], _test_ps)
-                else:
-                    _test_ps = cell.data_set(
-                        name, _diag_params[i][name], _test_ps)
-                _tv = jx.integrate(cell, param_state=_test_ps, delta_t=dt)
-                _tv_np = np.array(_tv[0])
-                _ts = int(np.sum(np.diff((_tv_np > -20).astype(int)) > 0))
-                logger.info(f"    Only {name} (branch={branch}): "
-                            f"spikes={_ts}, v_max={np.max(_tv_np):.1f}")
-
-
-        # Loss value check
-        _diag_loss_val = loss_fn_p1(opt_params)
-        _diag_loss_f = float(_diag_loss_val)
-        logger.info(f"  DIAG loss: {_diag_loss_f:.4f}, "
-                    f"finite={np.isfinite(_diag_loss_f)}")
-
-        # Gradient check
-        _diag_loss2, _diag_grad = jax.value_and_grad(loss_fn_p1)(opt_params)
-        _all_finite = True
-        for i, d in enumerate(_diag_grad):
-            for k, g in d.items():
-                g_ok = bool(jnp.all(jnp.isfinite(g)))
-                g_max = float(jnp.max(jnp.abs(g))) if g_ok else float('nan')
-                if not g_ok:
-                    _all_finite = False
-                logger.info(f"    grad[{i}] {k:>20s}: "
-                            f"finite={g_ok}, |g|_max={g_max:.6f}")
-        logger.info(f"  DIAG gradient: all_finite={_all_finite}")
-
-        if not _all_finite:
-            # Extra diagnostic: test each loss component separately
-            logger.info("  DIAG: Testing individual loss components...")
-
-            # Test MSE only
-            def _mse_only(opt_p):
-                p = transform.forward(opt_p)
-                ps = _apply_params_to_cell(cell, p, param_names, param_branches)
-                v = jx.integrate(cell, param_state=ps, delta_t=dt)
-                v_s = v[0]
-                n = min(len(v_s), len(target_v_jnp))
-                return jnp.mean((v_s[:n] - target_v_jnp[:n]) ** 2)
-
-            try:
-                _mse_l, _mse_g = jax.value_and_grad(_mse_only)(opt_params)
-                _mse_gf = all(bool(jnp.all(jnp.isfinite(g)))
-                              for d in _mse_g for g in d.values())
-                logger.info(f"    MSE-only: loss={float(_mse_l):.4f}, "
-                            f"grad_finite={_mse_gf}")
-            except Exception as e:
-                logger.info(f"    MSE-only: EXCEPTION {e}")
-
-            # Test spike count only
-            spike_k = shared["spike_k"]
-            spike_threshold = shared["spike_threshold"]
-            raw_tsc = shared["raw_target_spike_count"]
-            spike_norm = shared["spike_loss_normalizer"]
-
-            def _spike_only(opt_p):
-                p = transform.forward(opt_p)
-                ps = _apply_params_to_cell(cell, p, param_names, param_branches)
-                v = jx.integrate(cell, param_state=ps, delta_t=dt)
-                v_s = v[0]
-                n = min(len(v_s), len(target_v_jnp))
-                pr = jax.nn.sigmoid(spike_k * (v_s[:n] - spike_threshold))
-                dp = jnp.diff(pr)
-                soft_count = jnp.sum(jax.nn.relu(dp))
-                return ((soft_count - raw_tsc) / spike_norm) ** 2
-
-            try:
-                _sp_l, _sp_g = jax.value_and_grad(_spike_only)(opt_params)
-                _sp_gf = all(bool(jnp.all(jnp.isfinite(g)))
-                             for d in _sp_g for g in d.values())
-                logger.info(f"    Spike-only: loss={float(_sp_l):.4f}, "
-                            f"grad_finite={_sp_gf}")
-            except Exception as e:
-                logger.info(f"    Spike-only: EXCEPTION {e}")
-
-            # Test stats (windowed mean/std) only
-            n_windows = shared["n_windows"]
-            win_size = shared["win_size"]
-            tgt_means = shared["tgt_means"]
-            tgt_stds = shared["tgt_stds"]
-            mean_scale = shared["mean_scale"]
-            std_scale_val = shared["std_scale"]
-
-            def _stats_only(opt_p):
-                p = transform.forward(opt_p)
-                ps = _apply_params_to_cell(cell, p, param_names, param_branches)
-                v = jx.integrate(cell, param_state=ps, delta_t=dt)
-                v_s = v[0]
-                n = min(len(v_s), len(target_v_jnp))
-                sim_m, sim_s = [], []
-                for w in range(n_windows):
-                    s = w * win_size
-                    e = s + win_size if w < n_windows - 1 else n
-                    win = v_s[s:e]
-                    sim_m.append(jnp.mean(win))
-                    sim_s.append(jnp.std(win))
-                sim_m = jnp.stack(sim_m)
-                sim_s = jnp.stack(sim_s)
-                return (jnp.mean(jnp.abs(sim_m / mean_scale - tgt_means / mean_scale))
-                        + jnp.mean(jnp.abs(sim_s / std_scale_val - tgt_stds / std_scale_val)))
-
-            try:
-                _st_l, _st_g = jax.value_and_grad(_stats_only)(opt_params)
-                _st_gf = all(bool(jnp.all(jnp.isfinite(g)))
-                             for d in _st_g for g in d.values())
-                logger.info(f"    Stats-only: loss={float(_st_l):.4f}, "
-                            f"grad_finite={_st_gf}")
-            except Exception as e:
-                logger.info(f"    Stats-only: EXCEPTION {e}")
-
-            # Test baseline only
-            n_baseline = shared["n_baseline_est"]
-
-            def _baseline_only(opt_p):
-                p = transform.forward(opt_p)
-                ps = _apply_params_to_cell(cell, p, param_names, param_branches)
-                v = jx.integrate(cell, param_state=ps, delta_t=dt)
-                v_s = v[0]
-                n = min(len(v_s), len(target_v_jnp))
-                return jnp.mean((v_s[:n_baseline] - target_v_jnp[:n_baseline]) ** 2)
-
-            try:
-                _bl_l, _bl_g = jax.value_and_grad(_baseline_only)(opt_params)
-                _bl_gf = all(bool(jnp.all(jnp.isfinite(g)))
-                             for d in _bl_g for g in d.values())
-                logger.info(f"    Baseline-only: loss={float(_bl_l):.4f}, "
-                            f"grad_finite={_bl_gf}")
-            except Exception as e:
-                logger.info(f"    Baseline-only: EXCEPTION {e}")
-
+            logger.error(f"  DIAG: data_set KILLS SPIKING! "
+                         f"{_raw_spikes} spikes without param_state, "
+                         f"0 with. Check transform.inverse() and param naming.")
     except Exception as e:
-        logger.error(f"  DIAG EXCEPTION: {e}\n{traceback.format_exc()}")
+        logger.error(f"  DIAG EXCEPTION: {e}")
 
     # Step 7: Set up optimizer
     n_extra_channels = max(0, len(proposal.channels) - 3)

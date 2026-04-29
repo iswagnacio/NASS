@@ -154,13 +154,19 @@ def load_best_proposal(data_dir: Path, sga_history_path: Path = None) -> dict:
 # 2. Reconstruct Jaxley Cell from Proposal
 # ===========================================================================
 
-def reconstruct_cell(proposal: dict, dt: float = 0.025) -> jx.Compartment:
+def reconstruct_cell(proposal: dict, dt: float = 0.025) -> jx.Cell:
     """
-    Build a Jaxley single-compartment cell matching the SGA proposal.
+    Build a two-compartment Jaxley cell (soma + AIS) matching the SGA proposal.
 
     This reproduces exactly what general_fit.py does during training,
     but sets the FITTED parameters (not initial guesses) so the model
     is ready for forward simulation without further optimization.
+
+    Architecture:
+        Branch 0 (soma): LLM-proposed channels with fitted conductances
+        Branch 1 (AIS):  Fixed NaCortical + Kv3 + K + Leak with renamed
+                         prefixes (NaAIS, Kv3AIS, etc.) to avoid param
+                         name collisions.
 
     Args:
         proposal: dict with 'channels', 'fitted_params', 'radius',
@@ -168,7 +174,7 @@ def reconstruct_cell(proposal: dict, dt: float = 0.025) -> jx.Compartment:
         dt: simulation timestep in ms
 
     Returns:
-        Configured jx.Compartment ready for simulation
+        Configured jx.Cell ready for forward simulation
     """
     channels = proposal.get("channels", ["Na", "K", "Leak"])
     fitted = proposal.get("fitted_params", {})
@@ -176,53 +182,86 @@ def reconstruct_cell(proposal: dict, dt: float = 0.025) -> jx.Compartment:
     # Ensure required channels are present
     for required in ["Na", "K", "Leak"]:
         if required not in channels:
-            # Check if NaCortical is used instead of Na
             if required == "Na" and "NaCortical" in channels:
                 continue
             channels.insert(0, required)
             logger.info(f"  Auto-added required channel: {required}")
 
-    # Build compartment
-    comp = jx.Compartment()
+    # ---- Build two-compartment cell ----
+    soma_comp = jx.Compartment()
+    ais_comp = jx.Compartment()
+    try:
+        soma_branch = jx.Branch(soma_comp, ncomp=1)
+        ais_branch = jx.Branch(ais_comp, ncomp=1)
+    except TypeError:
+        soma_branch = jx.Branch(soma_comp, nseg=1)
+        ais_branch = jx.Branch(ais_comp, nseg=1)
 
+    cell = jx.Cell([soma_branch, ais_branch], parents=[-1, 0])
+
+    # ---- Soma channels (branch 0) ----
     for ch_name in channels:
         if ch_name not in ALL_CHANNELS:
             logger.warning(f"  Unknown channel '{ch_name}' — skipping")
             continue
-        comp.insert(ALL_CHANNELS[ch_name]())
+        cell.branch(0).insert(ALL_CHANNELS[ch_name]())
 
-    # Set geometry — use fitted values if available, else proposal defaults
+    # ---- AIS channels (branch 1) — fixed, renamed prefixes ----
+    # Must match AIS_CONFIG in general_fit.py exactly
+    cell.branch(1).insert(NaCortical(name="NaAIS"))
+    cell.branch(1).insert(Kv3(name="Kv3AIS"))
+    cell.branch(1).insert(K(name="KAIS"))
+    cell.branch(1).insert(Leak(name="LeakAIS"))
+
+    cell.branch(1).set("NaAIS_gNa", 0.25)
+    cell.branch(1).set("Kv3AIS_gKv3", 0.015)
+    cell.branch(1).set("KAIS_gK", 0.01)
+    cell.branch(1).set("LeakAIS_gLeak", 0.0001)
+    cell.branch(1).set("LeakAIS_eLeak", -67.0)
+    cell.branch(1).set("radius", 0.75)
+    cell.branch(1).set("length", 30.0)
+
+    # ---- Soma geometry — use fitted values if available ----
     radius = fitted.get("radius", proposal.get("radius", 10.0))
     length = proposal.get("length", 31.4)
     capacitance = fitted.get("capacitance", proposal.get("capacitance", 1.0))
 
-    comp.set("radius", radius)
-    comp.set("length", length)
-    comp.set("capacitance", capacitance)
-    comp.set("axial_resistivity", 100.0)
+    cell.branch(0).set("radius", radius)
+    cell.branch(0).set("length", length)
+    cell.branch(0).set("capacitance", capacitance)
 
-    # Set reversal potentials
-    eNa = fitted.get("eNa", 50.0)
+    # ---- Global parameters ----
+    cell.set("axial_resistivity", 150.0)  # fixed (Phase A validated)
+
+    # Reversal potentials — set globally first, then fitted values on soma
+    eNa = fitted.get("eNa", 55.0)
     eK = fitted.get("eK", -90.0)
-    comp.set("eNa", eNa)
-    comp.set("eK", eK)
+    cell.set("eNa", eNa)
+    cell.set("eK", eK)
+    cell.set("v", -67.0)
 
-    # Set all fitted conductance/parameter values
+    # Leak_eLeak on soma only (AIS has LeakAIS_eLeak set above)
+    if "Leak_eLeak" in fitted:
+        cell.branch(0).set("Leak_eLeak", fitted["Leak_eLeak"])
+    else:
+        cell.branch(0).set("Leak_eLeak", -70.0)
+
+    # ---- Set all fitted conductance values on soma ----
+    skip_params = {"radius", "length", "capacitance", "eNa", "eK", "Leak_eLeak"}
     for param_name, value in fitted.items():
-        # Skip geometry params already set above
-        if param_name in ("radius", "length", "capacitance", "eNa", "eK"):
+        if param_name in skip_params:
             continue
         try:
-            comp.set(param_name, value)
+            cell.branch(0).set(param_name, value)
         except Exception as e:
-            logger.warning(f"  Could not set {param_name}={value}: {e}")
+            logger.warning(f"  Could not set soma {param_name}={value}: {e}")
 
     logger.info(
-        f"  Reconstructed cell: channels={channels}, "
-        f"radius={radius:.1f}, length={length:.1f}, "
-        f"capacitance={capacitance:.2f}"
+        f"  Reconstructed 2-comp cell: soma channels={channels}, "
+        f"AIS=[NaAIS, Kv3AIS, KAIS, LeakAIS], "
+        f"radius={radius:.1f}, capacitance={capacitance:.2f}"
     )
-    return comp
+    return cell
 
 
 # ===========================================================================
@@ -263,7 +302,7 @@ def resample_stimulus(stimulus_nA: np.ndarray, sr_original: float,
         return np.interp(x_target, x_original, stimulus_nA)
 
 
-def simulate_held_out(cell: jx.Compartment, stimulus_nA: np.ndarray,
+def simulate_held_out(cell, stimulus_nA: np.ndarray,
                       dt: float = 0.025) -> np.ndarray:
     """
     Run a forward simulation on a held-out stimulus.
@@ -271,26 +310,32 @@ def simulate_held_out(cell: jx.Compartment, stimulus_nA: np.ndarray,
     No gradient computation, no optimization — just inject the stimulus
     and record the voltage response.
 
+    Handles both single-compartment (jx.Compartment) and two-compartment
+    (jx.Cell) models. For Cell, stimulus and recording target the soma
+    (branch 0, loc 0.0).
+
     Args:
-        cell: configured Jaxley compartment with fitted parameters
+        cell: configured Jaxley cell with fitted parameters
         stimulus_nA: stimulus waveform in nA at Jaxley timestep
         dt: simulation timestep in ms
 
     Returns:
         Simulated membrane voltage trace in mV
     """
-    # Clear any previous stimuli and recordings
     cell.delete_stimuli()
     cell.delete_recordings()
 
-    # Inject stimulus
     i_ext = jnp.array(stimulus_nA)
-    cell.stimulate(i_ext)
-    cell.record("v")
 
-    # Run simulation
+    if isinstance(cell, jx.Cell):
+        cell.branch(0).loc(0.0).stimulate(i_ext)
+        cell.branch(0).loc(0.0).record("v")
+    else:
+        cell.stimulate(i_ext)
+        cell.record("v")
+
     v = jx.integrate(cell, delta_t=dt)
-    return np.array(v[0])  # shape: (n_timesteps,)
+    return np.array(v[0])
 
 
 # ===========================================================================
